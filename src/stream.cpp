@@ -552,6 +552,11 @@ namespace stream {
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    bool encrypted_rtsp = false;
+    bool owns_privacy_screen = false;  ///< Accessed under the RTSP session list lock.
+    std::atomic<bool> sent_video_frame = false;
+#endif
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
 
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
@@ -1833,6 +1838,11 @@ namespace stream {
         });
 
         session->video.lowseq = lowseq;
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+        if (!session->sent_video_frame.load(std::memory_order_relaxed)) {
+          session->sent_video_frame.store(true, std::memory_order_release);
+        }
+#endif
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);
@@ -2194,6 +2204,30 @@ namespace stream {
       return session.client_cert;
     }
 
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    bool aurora_privacy_can_control(const session_t &session) {
+      return session.encrypted_rtsp && session.state.load(std::memory_order_acquire) == state_e::RUNNING &&
+             session.sent_video_frame.load(std::memory_order_acquire);
+    }
+
+    bool aurora_privacy_owned(const session_t &session) {
+      return session.owns_privacy_screen;
+    }
+
+    bool aurora_privacy_acquire(session_t &session) {
+      if (!session.owns_privacy_screen) {
+        session.owns_privacy_screen = display_device::aurora_screensaver_acquire();
+      }
+      return session.owns_privacy_screen;
+    }
+
+    void aurora_privacy_release(session_t &session) {
+      if (std::exchange(session.owns_privacy_screen, false)) {
+        display_device::aurora_screensaver_release();
+      }
+    }
+#endif
+
     /**
      * @brief Stop the active streaming session and prevent new packets from being queued.
      */
@@ -2233,6 +2267,7 @@ namespace stream {
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      aurora_privacy_release(session);
       if (config::aurora_privacy_screensaver) display_device::aurora_screensaver_release();
 #endif
       // Reset input on session stop to avoid stuck repeated keys
@@ -2318,6 +2353,9 @@ namespace stream {
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
       session->client_cert = launch_session.client_cert;
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      session->encrypted_rtsp = launch_session.rtsp_cipher.has_value();
+#endif
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
 
       session->config = config;

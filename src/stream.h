@@ -94,5 +94,11 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    bool aurora_privacy_can_control(const session_t &session);
+    bool aurora_privacy_owned(const session_t &session);
+    bool aurora_privacy_acquire(session_t &session);
+    void aurora_privacy_release(session_t &session);
+#endif
   }  // namespace session
 }  // namespace stream

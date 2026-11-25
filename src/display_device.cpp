@@ -1187,6 +1187,16 @@ namespace display_device {
     }
   }  // namespace
 
+  static std::atomic<bool> aurora_auto_wgc = false;
+
+  void aurora_try_wgc_for_auto_capture(bool enabled) {
+    aurora_auto_wgc.store(enabled);
+  }
+
+  bool aurora_wgc_capture_selected() {
+    return config::video.capture == "wgc" || (config::video.capture.empty() && aurora_auto_wgc.load());
+  }
+
   bool aurora_screensaver_supported() {
     static const bool supported_os = curtain_os_supported();
     return supported_os && curtain_dwm_ready() && (config::video.capture.empty() || config::video.capture == "wgc");
@@ -1199,7 +1209,7 @@ namespace display_device {
   bool aurora_screensaver_acquire() {
     std::lock_guard lock {curtain.mutex};
     if (curtain.sessions == 0) {
-      if (!aurora_screensaver_supported() || config::video.capture != "wgc") return false;
+      if (!aurora_screensaver_supported() || !aurora_wgc_capture_selected()) return false;
       std::promise<bool> ready;
       auto startup = ready.get_future();
       try {

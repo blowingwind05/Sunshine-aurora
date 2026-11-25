@@ -3524,7 +3524,21 @@ namespace video {
   }
 
   int probe_encoders() {
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    // Resolve automatic capture at startup, before launch waits for this probe.
+    // Keep the selected WGC backend pinned for the lifetime of a live session.
+    const bool try_wgc = get_encoder_capabilities().status == encoder_probe_status::probing &&
+                         config::video.capture.empty() && display_device::aurora_screensaver_supported();
+    if (try_wgc) display_device::aurora_try_wgc_for_auto_capture(true);
+    auto result = probe_encoders_impl();
+    if (try_wgc && result != 0) {
+      display_device::aurora_try_wgc_for_auto_capture(false);
+      BOOST_LOG(info) << "Aurora WGC probe failed; returning to automatic capture without live privacy";
+      result = probe_encoders_impl();
+    }
+#else
     const auto result = probe_encoders_impl();
+#endif
     {
       std::lock_guard lock {encoder_capabilities_mutex};
       if (result == 0) {

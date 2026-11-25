@@ -1014,7 +1014,12 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
-    if (config::video.capture == "ddx" || config::video.capture.empty()) {
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    const bool wgc_only = display_device::aurora_wgc_capture_selected();
+#else
+    const bool wgc_only = false;
+#endif
+    if (!wgc_only && (config::video.capture == "ddx" || config::video.capture.empty())) {
       if (hwdevice_type == mem_type_e::dxgi) {
         auto disp = std::make_shared<dxgi::display_ddup_vram_t>();
 

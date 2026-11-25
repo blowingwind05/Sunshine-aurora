@@ -12,6 +12,11 @@
 #include "thread_safe.h"
 
 namespace rtsp_stream {
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  enum class aurora_privacy_action { status, on, off };
+  std::string_view aurora_session_privacy(std::string_view cert, aurora_privacy_action action);
+#endif
+
   constexpr auto RTSP_SETUP_PORT = 21;  ///< GameStream base-port offset used for the RTSP setup listener.
 
   /**

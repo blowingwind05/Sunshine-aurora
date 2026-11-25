@@ -87,6 +87,30 @@ namespace nvhttp {
       context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
     }
 
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    crypto::x509_t peer_certificate(const Request &request) {
+      // Simple-Web-Server does not expose the TLS socket through Request. Match
+      // both ends of its live TCP connection under the server's connection lock.
+      const auto local = request.local_endpoint();
+      const auto remote = request.remote_endpoint();
+      if (local.port() == 0 || remote.port() == 0) return {};
+      SimpleWeb::LockGuard lock(connections->mutex);
+      for (const auto *connection : connections->set) {
+        const auto &socket = connection->socket->lowest_layer();
+        SimpleWeb::error_code ec;
+        if (socket.remote_endpoint(ec) != remote || ec || socket.local_endpoint(ec) != local || ec) continue;
+        return crypto::x509_t {
+  #if OPENSSL_VERSION_MAJOR >= 3
+          SSL_get1_peer_certificate(connection->socket->native_handle())
+  #else
+          SSL_get_peer_certificate(connection->socket->native_handle())
+  #endif
+        };
+      }
+      return {};
+    }
+#endif
+
     std::function<int(SSL *)> verify;  ///< Callback that validates a client's TLS certificate after handshake.
     std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;  ///< Handler used to return the pairing challenge when client verification fails.
 
@@ -472,7 +496,9 @@ namespace nvhttp {
    * @param args Arguments forwarded to the callable or parser.
    * @return Constructed launch session object.
    */
-  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args) {
+  using paired_identity_t = std::pair<std::string, std::string>;
+
+  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args, const paired_identity_t *identity) {
     auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
 
     launch_session->id = ++session_id_counter;
@@ -516,8 +542,8 @@ namespace nvhttp {
       launch_session->rtsp_iv_counter = 0;
     }
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
-    launch_session->client_cert = last_verified_client_cert;
-    launch_session->client_name = last_verified_client_name;
+    launch_session->client_cert = identity ? identity->first : last_verified_client_cert;
+    launch_session->client_name = identity ? identity->second : last_verified_client_name;
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
     unsigned char raw_payload[8];
@@ -1248,6 +1274,9 @@ namespace nvhttp {
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
     tree.put("root.AuroraPower", 1);
 #endif
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    tree.put("root.AuroraSessionPrivacy", 1);
+#endif
     tree.put("root.MaxLumaPixelsHEVC", encoder.hevc_mode > 1 ? "1869449984" : "0");
 
     // Only include the MAC address for requests sent from paired clients over HTTPS.
@@ -1382,7 +1411,7 @@ namespace nvhttp {
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client.
    */
-  void launch(bool &host_audio, resp_https_t response, req_https_t request) {
+  void launch(bool &host_audio, resp_https_t response, req_https_t request, const paired_identity_t *identity = nullptr) {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1431,7 +1460,7 @@ namespace nvhttp {
     video::wait_for_initial_encoder_probe();
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    auto launch_session = make_launch_session(host_audio, args);
+    auto launch_session = make_launch_session(host_audio, args, identity);
 
     if (rtsp_stream::session_count() == 0) {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
@@ -1508,7 +1537,7 @@ namespace nvhttp {
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client.
    */
-  void resume(bool &host_audio, resp_https_t response, req_https_t request) {
+  void resume(bool &host_audio, resp_https_t response, req_https_t request, const paired_identity_t *identity = nullptr) {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1560,7 +1589,7 @@ namespace nvhttp {
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
-    const auto launch_session = make_launch_session(host_audio, args);
+    const auto launch_session = make_launch_session(host_audio, args, identity);
 
     if (no_active_sessions) {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
@@ -1671,7 +1700,7 @@ namespace nvhttp {
   enum class aurora_power_action { restart, shutdown };
   using power_status = SimpleWeb::StatusCode;
 
-  void aurora_power_response(const resp_https_t &response, power_status status, std::string_view message, SimpleWeb::CaseInsensitiveMultimap headers = {}) {
+  void aurora_text_response(const resp_https_t &response, power_status status, std::string_view message, SimpleWeb::CaseInsensitiveMultimap headers = {}) {
     headers.emplace("Content-Type", "text/plain; charset=utf-8");
     headers.emplace("Cache-Control", "no-store");
     headers.emplace("Connection", "close");
@@ -1778,7 +1807,7 @@ namespace nvhttp {
     const bool shutdown = request->query_string == "action=shutdown"sv;
     if ((!restart && !shutdown) || request->content.size() != 0) {
       BOOST_LOG(warning) << "Aurora power request rejected: invalid action or unexpected body";
-      aurora_power_response(response, power_status::client_error_bad_request, "expected action=restart or action=shutdown with an empty body");
+      aurora_text_response(response, power_status::client_error_bad_request, "expected action=restart or action=shutdown with an empty body");
       return;
     }
 
@@ -1788,11 +1817,11 @@ namespace nvhttp {
     if (error != 0) {
       const auto result = describe_os_power_error(error);
       BOOST_LOG(warning) << "Aurora power request " << name << " failed: " << result.message << " (OS error " << error << ')';
-      aurora_power_response(response, result.status, result.message);
+      aurora_text_response(response, result.status, result.message);
       return;
     }
     BOOST_LOG(info) << "Aurora power request " << name << " accepted by the operating system";
-    aurora_power_response(response, power_status::success_accepted, "accepted");
+    aurora_text_response(response, power_status::success_accepted, "accepted");
   }
 #endif
 
@@ -1839,6 +1868,36 @@ namespace nvhttp {
              enabled device and "name" is the friendly client name set during pairing.
    */
   std::pair<bool, std::string> get_client_status(const std::string_view cert_pem);
+
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  std::optional<paired_identity_t> aurora_verified_peer(https_server_t &server, const https_server_t::Request &request) {
+    auto cert = server.peer_certificate(request);
+    if (!cert) return std::nullopt;
+    std::lock_guard lock {client_auth_mutex()};
+    if (verify_client_certificate(cert.get()) != nullptr) return std::nullopt;
+
+    auto pem = crypto::pem(cert);
+    return paired_identity_t {pem, get_client_status(pem).second};
+  }
+
+  void aurora_session_privacy(https_server_t &server, resp_https_t response, req_https_t request) {
+    using action_t = rtsp_stream::aurora_privacy_action;
+    const auto &query = request->query_string;
+    const auto action = query == "action=status"sv ? std::optional {action_t::status} :
+                        query == "action=on"sv ? std::optional {action_t::on} :
+                        query == "action=off"sv ? std::optional {action_t::off} : std::nullopt;
+    if (!action || request->content.size() != 0) {
+      aurora_text_response(response, SimpleWeb::StatusCode::client_error_bad_request, "expected action=status, action=on or action=off with an empty body");
+      return;
+    }
+    const auto identity = aurora_verified_peer(server, *request);
+    if (!identity) {
+      aurora_text_response(response, SimpleWeb::StatusCode::client_error_forbidden, "paired client certificate required");
+      return;
+    }
+    aurora_text_response(response, SimpleWeb::StatusCode::success_ok, rtsp_stream::aurora_session_privacy(identity->first, *action));
+  }
+#endif
 
   void start() {
     platf::set_thread_name("nvhttp");
@@ -1934,21 +1993,47 @@ namespace nvhttp {
     };
     https_server.resource["^/applist$"]["GET"] = applist;
     https_server.resource["^/appasset$"]["GET"] = appasset;
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    https_server.resource["^/aurora-session-privacy$"]["POST"] = [&https_server](resp_https_t resp, req_https_t req) {
+      aurora_session_privacy(https_server, resp, req);
+    };
+    https_server.resource["^/aurora-session-privacy$"]["GET"] = [](resp_https_t resp, req_https_t) {
+      aurora_text_response(resp, SimpleWeb::StatusCode::client_error_method_not_allowed, "POST required", {{"Allow", "POST"}});
+    };
+#endif
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
     https_server.resource["^/aurora-power$"]["POST"] = aurora_power;
     https_server.resource["^/aurora-power$"]["GET"] = [](resp_https_t resp, req_https_t) {
       BOOST_LOG(warning) << "Aurora power request rejected: POST required";
-      aurora_power_response(resp, power_status::client_error_method_not_allowed, "POST required", {{"Allow", "POST"}});
+      aurora_text_response(resp, power_status::client_error_method_not_allowed, "POST required", {{"Allow", "POST"}});
     };
 #endif
 #ifdef AURORA_SUNSHINE_HOST
     https_server.resource["^/aurora-wallpaper$"]["GET"] = aurora_wallpaper;
 #endif
-    https_server.resource["^/launch$"]["GET"] = [&host_audio](auto resp, auto req) {
+    https_server.resource["^/launch$"]["GET"] = [&host_audio, &https_server](auto resp, auto req) {
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      const auto identity = aurora_verified_peer(https_server, *req);
+      if (!identity) {
+        https_server.on_verify_failed(resp, req);
+        return;
+      }
+      launch(host_audio, resp, req, &*identity);
+#else
       launch(host_audio, resp, req);
+#endif
     };
-    https_server.resource["^/resume$"]["GET"] = [&host_audio](auto resp, auto req) {
+    https_server.resource["^/resume$"]["GET"] = [&host_audio, &https_server](auto resp, auto req) {
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      const auto identity = aurora_verified_peer(https_server, *req);
+      if (!identity) {
+        https_server.on_verify_failed(resp, req);
+        return;
+      }
+      resume(host_audio, resp, req, &*identity);
+#else
       resume(host_audio, resp, req);
+#endif
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
 

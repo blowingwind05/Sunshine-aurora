@@ -705,11 +705,56 @@ namespace rtsp_stream {
      * @brief Inserts the provided session into the set of sessions.
      * @param session The session to insert.
      */
-    void insert(const std::shared_ptr<stream::session_t> &session) {
+    [[nodiscard]] bool insert(const std::shared_ptr<stream::session_t> &session) {
       auto lg = _session_slots.lock();
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      if (std::ranges::any_of(*_session_slots, [](const auto &slot) {
+            return stream::session::aurora_privacy_owned(*slot);
+          })) return false;
+#endif
       _session_slots->emplace(session);
       BOOST_LOG(info) << "New streaming session started [active sessions: "sv << _session_slots->size() << ']';
+      return true;
     }
+
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    std::string_view session_privacy(std::string_view cert, aurora_privacy_action action) {
+      auto lg = _session_slots.lock();
+      using namespace stream::session;
+      if (cert.empty() || !display_device::aurora_wgc_capture_selected() ||
+          !display_device::aurora_screensaver_supported() || config::aurora_display_exclusive ||
+          config::aurora_privacy_screensaver ||
+          _session_slots->size() != 1) return "unavailable";
+      auto &slot = **_session_slots->begin();
+      if (client_cert(slot) != cert || !aurora_privacy_can_control(slot)) return "unavailable";
+
+      if (aurora_privacy_owned(slot)) {
+        if (!display_device::aurora_screensaver_active()) return "unavailable";
+        if (action != aurora_privacy_action::off) return "on";
+        aurora_privacy_release(slot);
+        return "off";
+      }
+      if (action != aurora_privacy_action::on) return "off";
+      if (!aurora_privacy_acquire(slot)) return "unavailable";
+
+      // The video/control workers can disconnect while the UI thread starts.
+      // Keep ownership until the existing shutdown path joins those workers.
+      return aurora_privacy_can_control(slot) && display_device::aurora_screensaver_active() ? "on" : "unavailable";
+    }
+
+    void check_live_privacy() {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (!stream::session::aurora_privacy_owned(*slot) ||
+            stream::session::state(*slot) != stream::session::state_e::RUNNING) continue;
+        if (!display_device::aurora_screensaver_active() ||
+            !nvhttp::aurora_screensaver_client_authorized(stream::session::client_cert(*slot))) {
+          BOOST_LOG(warning) << "Aurora session privacy lost coverage or authorization; ending its stream";
+          stream::session::stop(*slot);
+        }
+      }
+    }
+#endif
 
     /**
      * @brief Runs an iteration of the RTSP server loop
@@ -720,6 +765,7 @@ namespace rtsp_stream {
       if (session_count() > 0) {
         io_context.run_one_for(500ms);
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+        check_live_privacy();
         const auto now = std::chrono::steady_clock::now();
         if ((config::aurora_privacy_screensaver || !config::aurora_display_id.empty()) && now >= privacy_check_due) {
           privacy_check_due = now + 250ms;
@@ -762,6 +808,12 @@ namespace rtsp_stream {
   };
 
   rtsp_server_t server {};  ///< Singleton RTSP server used by GameStream launch sessions.
+
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  std::string_view aurora_session_privacy(std::string_view cert, aurora_privacy_action action) {
+    return server.session_privacy(cert, action);
+  }
+#endif
 
   /**
    * @brief Queue a launch session until the RTSP client connects.
@@ -1344,7 +1396,10 @@ namespace rtsp_stream {
 #endif
 
     auto stream_session = stream::session::alloc(config, session);
-    server->insert(stream_session);
+    if (!server->insert(stream_session)) {
+      respond(sock, session, &option, 503, "ANOTHER SESSION OWNS THE PRIVACY SCREEN", req->sequenceNumber, {});
+      return;
+    }
 
     if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string())) {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
