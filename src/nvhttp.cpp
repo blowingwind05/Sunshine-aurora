@@ -659,6 +659,7 @@ namespace nvhttp {
         .id = sess->async_insert_pin.id,
         .name = sess->async_insert_pin.device_name,
         .address = sess->async_insert_pin.address,
+        .source_port = sess->async_insert_pin.source_port,
       });
     }
     return result;
@@ -976,7 +977,9 @@ namespace nvhttp {
     sess.client.cert = util::from_hex_vec(get_arg(args, "clientcert"), true);
     sess.async_insert_pin.salt = get_arg(args, "salt");
     sess.async_insert_pin.device_name = get_arg(args, "devicename");
-    sess.async_insert_pin.address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    const auto source = request->remote_endpoint();
+    sess.async_insert_pin.address = net::addr_to_normalized_string(source.address());
+    sess.async_insert_pin.source_port = source.port();
 
     BOOST_LOG(debug) << sess.client.cert;
     const bool pin_stdin = config::sunshine.flags[config::flag::PIN_STDIN];
