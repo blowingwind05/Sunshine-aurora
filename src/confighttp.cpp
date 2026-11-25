@@ -2315,7 +2315,6 @@ namespace confighttp {
     const auto shutdown_event = mail::man->event<bool>(mail::shutdown);
 
     const auto port_https = net::map_port(PORT_HTTPS);
-    const auto address_family = net::af_from_enum_string(config::sunshine.address_family);
 
     https_server_t server {config::nvhttp.cert, config::nvhttp.pkey};
 
@@ -2387,10 +2386,15 @@ namespace confighttp {
     server.resource["^/assets\\/.+$"]["GET"] = getAsset;
 
     server.config.reuse_address = true;
-    server.config.address = net::get_bind_address(address_family);
-    server.config.port = port_https;
-
+#ifdef AURORA_SUNSHINE_HOST
+    // Only the configuration interface is loopback-only; GameStream still uses the streaming interfaces.
+    server.config.address = "127.0.0.1";
+    const auto display_addr = server.config.address;
+#else
+    server.config.address = net::get_bind_address(net::af_from_enum_string(config::sunshine.address_family));
     const auto display_addr = net::get_bind_address_url_host();
+#endif
+    server.config.port = port_https;
 
     auto accept_and_run = [&](auto *server) {
       try {

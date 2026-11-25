@@ -878,6 +878,11 @@ namespace platf {
 
   std::filesystem::path appdata();
 
+#ifdef AURORA_SUNSHINE_HOST
+  const std::filesystem::path &aurora_profile();
+  inline constexpr int AURORA_RESTART_EXIT_CODE = 42;
+#endif
+
   /**
    * @brief Return the hardware MAC address associated with a network address.
    *

@@ -182,6 +182,20 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
  * @return Process or platform callback exit code.
  */
 int main(int argc, char *argv[]) {
+#ifdef AURORA_SUNSHINE_HOST
+  wchar_t stop_name[128];
+  const auto stop_name_length = GetEnvironmentVariableW(L"AURORA_SUNSHINE_STOP_EVENT", stop_name, _countof(stop_name));
+  if (platf::aurora_profile().empty() || stop_name_length == 0 || stop_name_length >= _countof(stop_name)) {
+    return 1;
+  }
+  const auto aurora_stop = OpenEventW(SYNCHRONIZE, FALSE, stop_name);
+  if (!aurora_stop) {
+    return 1;
+  }
+  const auto close_aurora_stop = util::fail_guard([&]() { CloseHandle(aurora_stop); });
+  SetEnvironmentVariableW(L"AURORA_SUNSHINE_PROFILE", nullptr);
+  SetEnvironmentVariableW(L"AURORA_SUNSHINE_STOP_EVENT", nullptr);
+#endif
 #ifdef __linux__
   const bool privileged_execution = getauxval(AT_SECURE) != 0 || platf::has_elevated_privileges(true);
   if (privileged_execution && !platf::sanitize_process_environment()) {
@@ -239,6 +253,10 @@ int main(int argc, char *argv[]) {
   SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
 
   setlocale(LC_ALL, "C");
+#ifdef AURORA_SUNSHINE_HOST
+  // Sunshine uses narrow file APIs for parts of the profile under LocalAppData.
+  setlocale(LC_CTYPE, ".UTF-8");
+#endif
 #endif
 
 #pragma GCC diagnostic push
@@ -253,6 +271,9 @@ int main(int argc, char *argv[]) {
   if (config::parse(argc, argv)) {
     return 0;
   }
+#ifdef AURORA_SUNSHINE_HOST
+  config::sunshine.flags.reset(config::flag::UPNP);
+#endif
 
   auto log_deinit_guard = logging::init(config::sunshine.min_log_level, config::sunshine.log_file);
   if (!log_deinit_guard) {
@@ -516,6 +537,19 @@ int main(int argc, char *argv[]) {
 #endif
   }
 
+#ifdef AURORA_SUNSHINE_HOST
+  std::jthread aurora_shutdown {[&](std::stop_token stop) {
+    while (!stop.stop_requested() && !shutdown_event->peek()) {
+      const auto result = WaitForSingleObject(aurora_stop, 200);
+      if (result != WAIT_TIMEOUT) {
+        if (!shutdown_event->peek()) {
+          lifetime::exit_sunshine(0, true);
+        }
+        break;
+      }
+    }
+  }};
+#endif
   mainThreadLoop(shutdown_event);
 
   httpThread.join();

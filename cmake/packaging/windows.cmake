@@ -99,5 +99,7 @@ set(CPACK_COMPONENT_FIREWALL_DESCRIPTION "Scripts to enable or disable firewall 
 set(CPACK_COMPONENT_FIREWALL_GROUP "Scripts")
 
 # include specific packaging
-include(${CMAKE_MODULE_PATH}/packaging/windows_nsis.cmake)
-include(${CMAKE_MODULE_PATH}/packaging/windows_wix.cmake)
+if(NOT AURORA_SUNSHINE_HOST)
+    include(${CMAKE_MODULE_PATH}/packaging/windows_nsis.cmake)
+    include(${CMAKE_MODULE_PATH}/packaging/windows_wix.cmake)
+endif()

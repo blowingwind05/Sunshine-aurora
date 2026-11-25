@@ -144,7 +144,37 @@ namespace platf {
   decltype(WlanEnumInterfaces) *fn_WlanEnumInterfaces = nullptr;  ///< Fn wlan enum interfaces.
   decltype(WlanSetInterface) *fn_WlanSetInterface = nullptr;  ///< Fn wlan set interface.
 
+#ifdef AURORA_SUNSHINE_HOST
+  const std::filesystem::path &aurora_profile() {
+    static const auto path = []() -> std::filesystem::path {
+      constexpr auto variable = L"AURORA_SUNSHINE_PROFILE";
+      const auto size = GetEnvironmentVariableW(variable, nullptr, 0);
+      if (size == 0) {
+        return {};
+      }
+      std::wstring value(size, L'\0');
+      const auto length = GetEnvironmentVariableW(variable, value.data(), size);
+      if (length == 0 || length >= size) {
+        return {};
+      }
+      value.resize(length);
+      const std::filesystem::path directory {value};
+      const auto drive = directory.root_name().native();
+      if (!directory.is_absolute() || drive.size() != 2 || drive[1] != L':') {
+        return {};
+      }
+      return directory;
+    }();
+    return path;
+  }
+#endif
+
   std::filesystem::path appdata() {
+#ifdef AURORA_SUNSHINE_HOST
+    if (!aurora_profile().empty()) {
+      return aurora_profile();
+    }
+#endif
     WCHAR sunshine_path[MAX_PATH];
     GetModuleFileNameW(nullptr, sunshine_path, _countof(sunshine_path));
     return std::filesystem::path {sunshine_path}.remove_filename() / L"config"sv;
@@ -1311,6 +1341,9 @@ namespace platf {
   }
 
   void restart() {
+#ifdef AURORA_SUNSHINE_HOST
+    lifetime::exit_sunshine(AURORA_RESTART_EXIT_CODE, true);
+#else
     // If we're running standalone, we have to respawn ourselves via CreateProcess().
     // If we're running from the service, we should just exit and let it respawn us.
     if (GetConsoleWindow() != nullptr) {
@@ -1320,6 +1353,7 @@ namespace platf {
 
     // We use an async exit call here because we can't block the HTTP thread or we'll hang shutdown.
     lifetime::exit_sunshine(0, true);
+#endif
   }
 
   /**

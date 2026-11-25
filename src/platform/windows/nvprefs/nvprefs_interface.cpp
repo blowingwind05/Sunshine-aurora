@@ -10,12 +10,14 @@
 #include "nvprefs_interface.h"
 #include "undo_file.h"
 
+#ifndef AURORA_SUNSHINE_HOST
 namespace {
 
   const auto sunshine_program_data_folder = "Sunshine";
   const auto nvprefs_undo_file_name = "nvprefs_undo.json";
 
 }  // namespace
+#endif
 
 namespace nvprefs {
 
@@ -43,6 +45,10 @@ namespace nvprefs {
   }
 
   bool nvprefs_interface::load() {
+#ifdef AURORA_SUNSHINE_HOST
+    // The companion leaves the installed Sunshine application's NVIDIA settings and undo file alone.
+    return false;
+#else
     if (!pimpl->loaded) {
       // Check %ProgramData% variable, need it for storing undo file
       wchar_t program_data_env[MAX_PATH];
@@ -61,6 +67,7 @@ namespace nvprefs {
     }
 
     return pimpl->loaded;
+#endif
   }
 
   void nvprefs_interface::unload() {
