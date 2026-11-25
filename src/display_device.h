@@ -150,6 +150,10 @@ namespace display_device {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   [[nodiscard]] EnumeratedDeviceList aurora_virtual_displays();
   [[nodiscard]] bool aurora_display_ready();
+  [[nodiscard]] bool aurora_screensaver_supported();
+  [[nodiscard]] bool aurora_screensaver_active();
+  [[nodiscard]] bool aurora_screensaver_acquire();
+  void aurora_screensaver_release();
 #endif
 
   /**

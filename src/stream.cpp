@@ -2232,6 +2232,9 @@ namespace stream {
       session.audioThread.join();
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      if (config::aurora_privacy_screensaver) display_device::aurora_screensaver_release();
+#endif
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);

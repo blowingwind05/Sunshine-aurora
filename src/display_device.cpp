@@ -34,6 +34,11 @@
   #include <display_device/windows/win_api_layer.h>
   #include <display_device/windows/win_display_device.h>
   #if defined(AURORA_SUNSHINE_HOST)
+    #include <atomic>
+    #include <future>
+    #include <set>
+    #include <thread>
+    #include <dwmapi.h>
     #include <setupapi.h>
   #endif
 #endif
@@ -978,6 +983,248 @@ namespace display_device {
     auto devices = enumerate_devices();
     std::erase_if(devices, [&](const auto &device) { return !ids.contains(device.m_device_id); });
     return devices;
+  }
+
+  namespace {
+    constexpr auto curtain_class = L"AuroraPrivacyCurtain";
+
+    bool curtain_dwm_ready() {
+      BOOL active = FALSE;
+      return SUCCEEDED(DwmIsCompositionEnabled(&active)) && active;
+    }
+
+    bool curtain_os_supported() {
+      // Windows versions before 2004 can silently treat EXCLUDEFROMCAPTURE as MONITOR.
+      using get_version_t = LONG(WINAPI *)(OSVERSIONINFOW *);
+      const auto get_version = reinterpret_cast<get_version_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+      OSVERSIONINFOW version {};
+      version.dwOSVersionInfoSize = sizeof(version);
+      return get_version && get_version(&version) == 0 && version.dwBuildNumber >= 19041;
+    }
+
+    bool curtain_on_input_desktop() {
+      const auto input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+      if (!input) return false;
+      const auto close = util::fail_guard([&] { CloseDesktop(input); });
+      // Only the interactive Default desktop. Leave secure and lock desktops alone.
+      wchar_t input_name[64] {};
+      wchar_t thread_name[64] {};
+      return GetUserObjectInformationW(input, UOI_NAME, input_name, sizeof(input_name), nullptr) &&
+             GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, thread_name, sizeof(thread_name), nullptr) &&
+             _wcsicmp(input_name, L"Default") == 0 && _wcsicmp(thread_name, input_name) == 0;
+    }
+
+    struct curtain_monitor {
+      std::wstring source;
+      RECT rectangle;
+    };
+
+    std::optional<std::vector<curtain_monitor>> curtain_monitors() {
+      const WinApiLayer win;
+      const auto paths = win.queryDisplayConfig(QueryType::Active);
+      if (!paths) return std::nullopt;
+
+      // Match EnumDisplayMonitors to the active desktop sources. This filters
+      // pseudo-monitors and works for USB, direct, and virtual display adapters.
+      std::set<std::wstring> active_sources;
+      for (const auto &path : paths->m_paths) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source {};
+        source.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(source), path.sourceInfo.adapterId, path.sourceInfo.id};
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS || source.viewGdiDeviceName[0] == L'\0') return std::nullopt;
+        active_sources.emplace(source.viewGdiDeviceName);
+      }
+
+      if (active_sources.empty()) return std::nullopt;
+
+      std::vector<curtain_monitor> monitors;
+      const auto enumerate = [](HMONITOR monitor, HDC, LPRECT, LPARAM context) -> BOOL {
+        MONITORINFOEXW info {};
+        info.cbSize = sizeof(info);
+        if (!GetMonitorInfoW(monitor, &info)) return FALSE;
+        reinterpret_cast<std::vector<curtain_monitor> *>(context)->push_back({info.szDevice, info.rcMonitor});
+        return TRUE;
+      };
+      if (!EnumDisplayMonitors(nullptr, nullptr, enumerate, reinterpret_cast<LPARAM>(&monitors))) return std::nullopt;
+      std::erase_if(monitors, [&](const auto &monitor) { return !active_sources.contains(monitor.source); });
+      if (monitors.size() != active_sources.size()) return std::nullopt;
+      std::ranges::sort(monitors, {}, &curtain_monitor::source);
+      if (!std::ranges::equal(monitors, active_sources, {}, &curtain_monitor::source, std::identity {})) return std::nullopt;
+      return monitors;
+    }
+
+    LRESULT CALLBACK curtain_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+      if (message == WM_PAINT) {
+        PAINTSTRUCT paint {};
+        const auto dc = BeginPaint(window, &paint);
+        RECT bounds {};
+        GetClientRect(window, &bounds);
+        FillRect(dc, &bounds, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(188, 203, 222));
+        DrawTextW(dc, L"Aurora  |  隐私屏保", -1, &bounds, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+        EndPaint(window, &paint);
+        return 0;
+      }
+      return DefWindowProcW(window, message, wparam, lparam);
+    }
+
+    bool curtain_window_valid(HWND window, const RECT &expected) {
+      DWORD affinity = WDA_NONE;
+      RECT actual {};
+      return IsWindowVisible(window) &&
+             (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOPMOST) &&
+             GetWindowDisplayAffinity(window, &affinity) && affinity == WDA_EXCLUDEFROMCAPTURE &&
+             GetWindowRect(window, &actual) && EqualRect(&expected, &actual);
+    }
+
+    struct curtain_state {
+      std::mutex mutex;
+      unsigned sessions = 0;
+      std::atomic<bool> visible = false;
+      std::jthread worker;
+    } curtain;
+
+    void curtain_ui(std::stop_token stop, std::promise<bool> started) {
+      bool signaled = false;
+      const auto finish = util::fail_guard([&] {
+        curtain.visible = false;
+        if (!signaled) started.set_value(false);
+      });
+      try {
+        if (!SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) || !curtain_on_input_desktop()) {
+          BOOST_LOG(warning) << "Aurora privacy screen requires the interactive desktop and per-monitor DPI support";
+          return;
+        }
+        const auto monitors = curtain_monitors();
+        if (!monitors) {
+          BOOST_LOG(warning) << "Aurora could not match the active desktop monitors for the privacy screen";
+          return;
+        }
+        const auto instance = GetModuleHandleW(nullptr);
+        WNDCLASSW window_class {};
+        window_class.lpfnWndProc = curtain_window_proc;
+        window_class.hInstance = instance;
+        window_class.lpszClassName = curtain_class;
+        if (!RegisterClassW(&window_class)) {
+          BOOST_LOG(warning) << "Aurora could not register the privacy screen window: " << GetLastError();
+          return;
+        }
+        const auto unregister = util::fail_guard([&] { UnregisterClassW(curtain_class, instance); });
+        std::vector<HWND> windows;
+        windows.reserve(monitors->size());
+        const auto close_windows = util::fail_guard([&] {
+          for (const auto window : windows) DestroyWindow(window);
+        });
+
+        // Prepare capture exclusion on every window before showing any window.
+        for (const auto &monitor : *monitors) {
+          const auto &rect = monitor.rectangle;
+          const auto window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, curtain_class,
+            L"Aurora Privacy Screen", WS_POPUP | WS_DISABLED, rect.left, rect.top, rect.right - rect.left,
+            rect.bottom - rect.top, nullptr, nullptr, instance, nullptr);
+          if (!window) {
+            BOOST_LOG(warning) << "Aurora could not create a privacy screen window: " << GetLastError();
+            return;
+          }
+          windows.push_back(window);
+          DWORD affinity = WDA_NONE;
+          if (!SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE) ||
+              !GetWindowDisplayAffinity(window, &affinity) || affinity != WDA_EXCLUDEFROMCAPTURE) {
+            BOOST_LOG(warning) << "Aurora could not exclude a privacy screen window from capture";
+            return;
+          }
+        }
+
+        const auto windows_valid = [&] {
+          for (std::size_t i = 0; i < windows.size(); ++i) {
+            if (!curtain_window_valid(windows[i], (*monitors)[i].rectangle)) return false;
+          }
+          return true;
+        };
+        for (const auto window : windows) {
+          if (stop.stop_requested() ||
+              !SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+            BOOST_LOG(warning) << "Aurora could not show every privacy screen window";
+            return;
+          }
+          UpdateWindow(window);
+        }
+        if (FAILED(DwmFlush()) || !windows_valid() || !curtain_on_input_desktop()) {
+          BOOST_LOG(warning) << "Aurora could not verify privacy screen coverage";
+          return;
+        }
+
+        curtain.visible = true;
+        started.set_value(true);
+        signaled = true;
+        auto check_due = std::chrono::steady_clock::now();
+        bool lost = false;
+        while (!stop.stop_requested()) {
+          MSG message;
+          while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) lost = true;
+            DispatchMessageW(&message);
+          }
+          const auto now = std::chrono::steady_clock::now();
+          if (!lost && now >= check_due) {
+            check_due = now + std::chrono::milliseconds(250);
+            const auto live = curtain_monitors();
+            lost = !curtain_on_input_desktop() || !curtain_dwm_ready() || !windows_valid() || !live ||
+                   !std::ranges::equal(*monitors, *live, [](const auto &a, const auto &b) {
+                     return a.source == b.source && EqualRect(&a.rectangle, &b.rectangle);
+                   });
+          }
+          if (lost) {
+            // Let RTSP end capture before removing the remaining curtains.
+            curtain.visible = false;
+          }
+          MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
+        }
+      } catch (const std::exception &error) {
+        BOOST_LOG(warning) << "Aurora privacy screen worker failed: " << error.what();
+      }
+    }
+  }  // namespace
+
+  bool aurora_screensaver_supported() {
+    static const bool supported_os = curtain_os_supported();
+    return supported_os && curtain_dwm_ready() && (config::video.capture.empty() || config::video.capture == "wgc");
+  }
+
+  bool aurora_screensaver_active() {
+    return curtain.visible;
+  }
+
+  bool aurora_screensaver_acquire() {
+    std::lock_guard lock {curtain.mutex};
+    if (curtain.sessions == 0) {
+      if (!aurora_screensaver_supported() || config::video.capture != "wgc") return false;
+      std::promise<bool> ready;
+      auto startup = ready.get_future();
+      try {
+        curtain.worker = std::jthread(curtain_ui, std::move(ready));
+        if (startup.wait_for(std::chrono::seconds(3)) != std::future_status::ready || !startup.get()) {
+          curtain.worker = {};
+          return false;
+        }
+      } catch (const std::exception &error) {
+        BOOST_LOG(warning) << "Aurora could not start the privacy screen worker: " << error.what();
+        curtain.worker = {};
+        return false;
+      }
+    }
+    if (!curtain.visible) {
+      if (curtain.sessions == 0) curtain.worker = {};
+      return false;
+    }
+    ++curtain.sessions;
+    return true;
+  }
+
+  void aurora_screensaver_release() {
+    std::lock_guard lock {curtain.mutex};
+    if (--curtain.sessions == 0) curtain.worker = {};
   }
 
   bool aurora_display_ready() {

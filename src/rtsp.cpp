@@ -28,9 +28,11 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "nvhttp.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
+#include "utility.h"
 #include "video.h"
 
 namespace asio = boost::asio;
@@ -719,9 +721,12 @@ namespace rtsp_stream {
         io_context.run_one_for(500ms);
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
         const auto now = std::chrono::steady_clock::now();
-        if (!config::aurora_display_id.empty() && now >= privacy_check_due) {
-          privacy_check_due = now + 500ms;
-          if (!display_device::aurora_display_ready()) {
+        if ((config::aurora_privacy_screensaver || !config::aurora_display_id.empty()) && now >= privacy_check_due) {
+          privacy_check_due = now + 250ms;
+          if (config::aurora_privacy_screensaver && !display_device::aurora_screensaver_active()) {
+            BOOST_LOG(warning) << "Aurora privacy screen coverage changed; ending the stream";
+            clear();
+          } else if (!config::aurora_display_id.empty() && !display_device::aurora_display_ready()) {
             BOOST_LOG(warning) << "Aurora virtual display configuration changed; ending the stream";
             clear();
           }
@@ -1326,6 +1331,18 @@ namespace rtsp_stream {
       return;
     }
 
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    if (config::aurora_privacy_screensaver &&
+        (!nvhttp::aurora_screensaver_client_authorized(session.client_cert) || !display_device::aurora_screensaver_acquire())) {
+      BOOST_LOG(warning) << "Aurora could not activate the privacy screen for the streaming session";
+      respond(sock, session, &option, 503, "PRIVACY SCREEN UNAVAILABLE", req->sequenceNumber, {});
+      return;
+    }
+    auto release_privacy = util::fail_guard([] {
+      if (config::aurora_privacy_screensaver) display_device::aurora_screensaver_release();
+    });
+#endif
+
     auto stream_session = stream::session::alloc(config, session);
     server->insert(stream_session);
 
@@ -1337,6 +1354,10 @@ namespace rtsp_stream {
       return;
     }
 
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    // A started capture session now owns the curtain until its workers have joined.
+    release_privacy.disable();
+#endif
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }
 

@@ -1342,7 +1342,22 @@ namespace nvhttp {
   }
 
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  bool aurora_screensaver_client_authorized(std::string_view cert) {
+    auto certificate = crypto::x509(cert);
+    if (!certificate) return false;
+    const std::lock_guard lock {client_auth_mutex()};
+    return verify_client_certificate(certificate.get()) == nullptr;
+  }
+
   bool aurora_check_display(pt::ptree &tree, bool before_switch) {
+    if (before_switch && config::aurora_privacy_screensaver && !display_device::aurora_screensaver_supported()) {
+      BOOST_LOG(warning) << "Aurora privacy screen requires Windows Graphics Capture and display affinity support";
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Aurora: the privacy screen requires Windows Graphics Capture");
+      tree.put("root.gamesession", 0);
+      tree.put("root.resume", 0);
+      return false;
+    }
     const auto &target = config::aurora_display_id;
     if (target.empty()) return true;
     if (before_switch) {

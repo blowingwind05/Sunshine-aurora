@@ -717,6 +717,7 @@ namespace config {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   std::string aurora_display_id;
   bool aurora_display_exclusive;
+  bool aurora_privacy_screensaver;
 #endif
 
   video_t video {
@@ -1723,6 +1724,13 @@ namespace config {
     string_f(vars, "aurora_privacy_display_id", exclusive_display);
     string_f(vars, "aurora_virtual_display_id", aurora_display_id);
     aurora_display_exclusive = !exclusive_display.empty();
+    std::string screensaver;
+    string_f(vars, "aurora_privacy_screensaver", screensaver);
+    aurora_privacy_screensaver = screensaver == "enabled" && !aurora_display_exclusive;
+    if (aurora_privacy_screensaver && video.capture.empty()) {
+      // WGC supports display affinity. Do not let automatic capture fall back to DXGI.
+      video.capture = "wgc";
+    }
     if (aurora_display_exclusive) aurora_display_id = std::move(exclusive_display);
     if (!aurora_display_id.empty()) {
       video.output_name = aurora_display_id;

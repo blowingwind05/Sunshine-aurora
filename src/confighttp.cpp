@@ -1451,7 +1451,11 @@ namespace confighttp {
     const auto &extended_display = vars["aurora_virtual_display_id"];
     send_response(response, {{"status", true}, {"saved", exclusive_display.empty() ? extended_display : exclusive_display},
       {"saved_exclusive", !exclusive_display.empty()}, {"active", config::aurora_display_id},
-      {"active_exclusive", config::aurora_display_exclusive}, {"displays", std::move(displays)}});
+      {"active_exclusive", config::aurora_display_exclusive},
+      {"supports_virtual_display", true}, {"supports_screensaver", display_device::aurora_screensaver_supported()},
+      {"saved_screensaver", vars["aurora_privacy_screensaver"] == "enabled"},
+      {"active_screensaver", config::aurora_privacy_screensaver},
+      {"screensaver_visible", display_device::aurora_screensaver_active()}, {"displays", std::move(displays)}});
   }
 #endif
 

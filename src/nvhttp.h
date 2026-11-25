@@ -29,6 +29,9 @@
  * @brief Contains all the functions and variables related to the nvhttp (GameStream) server.
  */
 namespace nvhttp {
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  [[nodiscard]] bool aurora_screensaver_client_authorized(std::string_view cert);
+#endif
 
   /**
    * @brief The protocol version.
