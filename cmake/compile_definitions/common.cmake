@@ -138,8 +138,6 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/nanors/deps/obl/oblas_common.c"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/nanors/deps/obl/oblas_lite.c"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/nanors/rs.c"
-        "${CMAKE_SOURCE_DIR}/src/upnp.cpp"
-        "${CMAKE_SOURCE_DIR}/src/upnp.h"
         "${CMAKE_SOURCE_DIR}/src/cbs.cpp"
         "${CMAKE_SOURCE_DIR}/src/utility.h"
         "${CMAKE_SOURCE_DIR}/src/uuid.h"
@@ -223,8 +221,14 @@ if(NOT APPLE)
     include_directories(BEFORE SYSTEM "${NV_CODEC_HEADERS_13_1_INCLUDE_DIR}")
 endif()
 
+if(NOT AURORA_SUNSHINE_HOST)
+    list(APPEND SUNSHINE_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/upnp.cpp"
+            "${CMAKE_SOURCE_DIR}/src/upnp.h")
+    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES ${MINIUPNP_LIBRARIES})
+endif()
+
 list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
-        ${MINIUPNP_LIBRARIES}
         ${CMAKE_THREAD_LIBS_INIT}
         enet
         libdisplaydevice::display_device

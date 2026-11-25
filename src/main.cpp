@@ -50,7 +50,9 @@
 #include "nvhttp.h"
 #include "process.h"
 #include "system_tray.h"
-#include "upnp.h"
+#ifndef AURORA_SUNSHINE_HOST
+  #include "upnp.h"
+#endif
 #include "video.h"
 #ifdef AURORA_MACOS_PRIVACY_PREVIEW
   #include "src/platform/macos/aurora_privacy.h"
@@ -570,10 +572,12 @@ int main(int argc, char *argv[]) {
     mDNS = platf::publish::start();
   });
 
+#ifndef AURORA_SUNSHINE_HOST
   std::unique_ptr<platf::deinit_t> upnp_unmap;
   auto sync_upnp = std::async(std::launch::async, [&upnp_unmap]() {
     upnp_unmap = upnp::start();
   });
+#endif
 
   // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
   if (shutdown_event->peek()) {
