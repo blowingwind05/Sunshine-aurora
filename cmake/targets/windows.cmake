@@ -7,3 +7,7 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         Windowsapp.lib
         Wtsapi32.lib
         version.lib)
+
+if(AURORA_SUNSHINE_HOST)
+    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES shell32 ole32 uuid advapi32)
+endif()

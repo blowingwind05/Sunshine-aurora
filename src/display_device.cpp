@@ -34,6 +34,7 @@
   #include <display_device/windows/win_api_layer.h>
   #include <display_device/windows/win_display_device.h>
   #if defined(AURORA_SUNSHINE_HOST)
+    #include "AuroraHostPrivacyOverlay.h"
     #include <atomic>
     #include <future>
     #include <set>
@@ -1083,6 +1084,11 @@ namespace display_device {
       unsigned sessions = 0;
       std::atomic<bool> visible = false;
       std::jthread worker;
+      std::unique_ptr<aurora::host::PrivacyTestOverlay> test_overlay;
+
+      bool covered() const {
+        return test_overlay ? test_overlay->active() : visible.load();
+      }
     } curtain;
 
     void curtain_ui(std::stop_token stop, std::promise<bool> started) {
@@ -1203,20 +1209,29 @@ namespace display_device {
   }
 
   bool aurora_screensaver_active() {
-    return curtain.visible;
+    std::lock_guard lock {curtain.mutex};
+    return curtain.covered();
   }
 
   bool aurora_screensaver_acquire() {
     std::lock_guard lock {curtain.mutex};
     if (curtain.sessions == 0) {
       if (!aurora_screensaver_supported() || !aurora_wgc_capture_selected()) return false;
-      std::promise<bool> ready;
-      auto startup = ready.get_future();
       try {
-        curtain.worker = std::jthread(curtain_ui, std::move(ready));
-        if (startup.wait_for(std::chrono::seconds(3)) != std::future_status::ready || !startup.get()) {
-          curtain.worker = {};
-          return false;
+        if (aurora::host::privacy_uiaccess_requested(platf::aurora_profile())) {
+          curtain.test_overlay = aurora::host::PrivacyTestOverlay::start();
+          if (!curtain.test_overlay) {
+            BOOST_LOG(warning) << "Aurora could not start the installed UIAccess privacy test overlay";
+            return false;
+          }
+        } else {
+          std::promise<bool> ready;
+          auto startup = ready.get_future();
+          curtain.worker = std::jthread(curtain_ui, std::move(ready));
+          if (startup.wait_for(std::chrono::seconds(3)) != std::future_status::ready || !startup.get()) {
+            curtain.worker = {};
+            return false;
+          }
         }
       } catch (const std::exception &error) {
         BOOST_LOG(warning) << "Aurora could not start the privacy screen worker: " << error.what();
@@ -1224,8 +1239,11 @@ namespace display_device {
         return false;
       }
     }
-    if (!curtain.visible) {
-      if (curtain.sessions == 0) curtain.worker = {};
+    if (!curtain.covered()) {
+      if (curtain.sessions == 0) {
+        curtain.worker = {};
+        curtain.test_overlay.reset();
+      }
       return false;
     }
     ++curtain.sessions;
@@ -1234,7 +1252,10 @@ namespace display_device {
 
   void aurora_screensaver_release() {
     std::lock_guard lock {curtain.mutex};
-    if (--curtain.sessions == 0) curtain.worker = {};
+    if (curtain.sessions && --curtain.sessions == 0) {
+      curtain.worker = {};
+      curtain.test_overlay.reset();
+    }
   }
 
   bool aurora_display_ready() {
