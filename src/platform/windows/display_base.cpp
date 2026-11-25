@@ -40,6 +40,9 @@ typedef enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE : DWORD {
 #include "display.h"
 #include "misc.h"
 #include "src/config.h"
+#ifdef AURORA_SUNSHINE_HOST
+  #include "src/aurora_capture_geometry.h"
+#endif
 #include "src/display_device.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -1121,6 +1124,37 @@ namespace platf {
 
     return display_names;
   }
+
+#ifdef AURORA_SUNSHINE_HOST
+  std::optional<aurora_capture_dimensions> aurora_capture_size() {
+    const auto configured = display_device::map_output_name(config::video.output_name);
+    if (!config::video.output_name.empty() && configured.empty()) {
+      return std::nullopt;
+    }
+
+    std::optional<aurora_capture_dimensions> size;
+    // Query only active display modes. DXGI capture probing at this point would
+    // repeat encoder detection and slow down an ordinary GameStream handshake.
+    for (const auto &output : display_device::enumerate_devices()) {
+      if (!output.m_info || output.m_display_name.empty() ||
+          (!configured.empty() && output.m_display_name != configured)) {
+        continue;
+      }
+      const auto &resolution = output.m_info->m_resolution;
+      if (!resolution.m_width || !resolution.m_height) {
+        continue;
+      }
+      const aurora_capture_dimensions candidate {resolution.m_width, resolution.m_height};
+      // Automatic capture can choose any available output. Different modes
+      // mean we cannot safely announce one geometry before the session starts.
+      if (size && *size != candidate) {
+        return std::nullopt;
+      }
+      size = candidate;
+    }
+    return size;
+  }
+#endif
 
   /**
    * @brief Check whether DXGI reports that adapter or driver enumeration is stale.
