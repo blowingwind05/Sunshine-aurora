@@ -1,4 +1,8 @@
 # macos specific target definitions
+option(AURORA_SUNSHINE_HOST "Build the macOS host companion managed by Aurora" OFF)
+if(AURORA_SUNSHINE_HOST)
+    target_compile_definitions(sunshine PRIVATE AURORA_SUNSHINE_HOST=1)
+endif()
 
 if (SUNSHINE_BUILD_HOMEBREW)
     target_link_options(sunshine PRIVATE LINKER:-sectcreate,__TEXT,__info_plist,${APPLE_PLIST_FILE})

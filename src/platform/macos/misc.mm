@@ -18,6 +18,9 @@
 
 // platform includes
 #include <arpa/inet.h>
+#ifdef AURORA_SUNSHINE_HOST
+  #include <ApplicationServices/ApplicationServices.h>
+#endif
 #include <dlfcn.h>
 #include <Foundation/Foundation.h>
 #include <mach-o/dyld.h>
@@ -97,18 +100,37 @@ namespace platf {
       return nullptr;
     }
 #pragma clang diagnostic pop
+#ifdef AURORA_SUNSHINE_HOST
+    if (!AXIsProcessTrusted()) {
+      const void *keys[] = {kAXTrustedCheckOptionPrompt};
+      const void *values[] = {kCFBooleanTrue};
+      if (const auto options = CFDictionaryCreate(nullptr, keys, values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks)) {
+        AXIsProcessTrustedWithOptions(options);
+        CFRelease(options);
+      }
+    }
+#endif
     // Record that we determined that we have the screen capture permission.
     screen_capture_allowed = true;
     return std::make_unique<deinit_t>();
   }
 
   fs::path appdata() {
+#ifdef AURORA_SUNSHINE_HOST
+    static const auto profile = [] {
+      const auto *value = getenv("AURORA_SUNSHINE_PROFILE");
+      const auto path = value ? fs::path {value} : fs::path {};
+      return path.is_absolute() ? path : fs::path {};
+    }();
+    return profile;
+#else
     const char *homedir;
     if ((homedir = getenv("HOME")) == nullptr) {
       homedir = getpwuid(geteuid())->pw_dir;
     }
 
     return fs::path {homedir} / ".config/sunshine"sv;
+#endif
   }
 
   using ifaddr_t = util::safe_ptr<ifaddrs, freeifaddrs>;
@@ -357,9 +379,13 @@ namespace platf {
   }
 
   void restart() {
+#ifdef AURORA_SUNSHINE_HOST
+    lifetime::exit_sunshine(42, true);
+#else
     // Gracefully clean up and restart ourselves instead of exiting
     atexit(restart_on_exit);
     lifetime::exit_sunshine(0, true);
+#endif
   }
 
   bool request_process_group_exit(std::uintptr_t native_handle) {

@@ -14,6 +14,12 @@
 // platform includes
 #ifdef __APPLE__
   #include <mach-o/dyld.h>
+  #ifdef AURORA_SUNSHINE_HOST
+    #include <fcntl.h>
+    #include <poll.h>
+    #include <sys/stat.h>
+    #include <unistd.h>
+  #endif
 #endif
 #ifdef __linux__
   #include "platform/linux/graphics.h"
@@ -182,6 +188,19 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
  * @return Process or platform callback exit code.
  */
 int main(int argc, char *argv[]) {
+#ifdef AURORA_SUNSHINE_HOST
+  if (argc == 2 && std::strcmp(argv[1], "--aurora-runtime-info") == 0) {
+    std::cout << "aurora-host/1" << std::endl;
+    return 0;
+  }
+  struct stat aurora_pipe {};
+  if (platf::appdata().empty() || fstat(STDIN_FILENO, &aurora_pipe) != 0 || !S_ISFIFO(aurora_pipe.st_mode)) {
+    return 1;
+  }
+  unsetenv("AURORA_SUNSHINE_PROFILE");
+  // Keep the parent pipe out of programs launched by Sunshine.
+  if (fcntl(STDIN_FILENO, F_SETFD, FD_CLOEXEC) == -1) return 1;
+#endif
 #ifdef __linux__
   const bool privileged_execution = getauxval(AT_SECURE) != 0 || platf::has_elevated_privileges(true);
   if (privileged_execution && !platf::sanitize_process_environment()) {
@@ -253,6 +272,10 @@ int main(int argc, char *argv[]) {
   if (config::parse(argc, argv)) {
     return 0;
   }
+
+#ifdef AURORA_SUNSHINE_HOST
+  config::sunshine.flags.reset(config::flag::UPNP);
+#endif
 
   auto log_deinit_guard = logging::init(config::sunshine.min_log_level, config::sunshine.log_file);
   if (!log_deinit_guard) {
@@ -516,6 +539,20 @@ int main(int argc, char *argv[]) {
 #endif
   }
 
+#ifdef AURORA_SUNSHINE_HOST
+  std::jthread aurora_shutdown {[&](std::stop_token stop) {
+    // Closing the parent pipe also covers an unexpected exit of Aurora.
+    while (!stop.stop_requested() && !shutdown_event->peek()) {
+      pollfd descriptor {STDIN_FILENO, 0, 0};
+      const auto ready = poll(&descriptor, 1, 200);
+      if ((ready > 0 && (descriptor.revents & (POLLHUP | POLLERR | POLLNVAL))) ||
+          (ready < 0 && errno != EINTR)) {
+        if (!shutdown_event->peek()) lifetime::exit_sunshine(0, true);
+        break;
+      }
+    }
+  }};
+#endif
   mainThreadLoop(shutdown_event);
 
   httpThread.join();

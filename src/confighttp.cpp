@@ -2387,10 +2387,15 @@ namespace confighttp {
     server.resource["^/assets\\/.+$"]["GET"] = getAsset;
 
     server.config.reuse_address = true;
+#ifdef AURORA_SUNSHINE_HOST
+    // Limit the configuration UI to loopback and keep GameStream routable.
+    server.config.address = "127.0.0.1";
+    const auto display_addr = server.config.address;
+#else
     server.config.address = net::get_bind_address(address_family);
-    server.config.port = port_https;
-
     const auto display_addr = net::get_bind_address_url_host();
+#endif
+    server.config.port = port_https;
 
     auto accept_and_run = [&](auto *server) {
       try {
