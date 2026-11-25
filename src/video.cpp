@@ -7,7 +7,9 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <condition_variable>
 #include <list>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -1469,9 +1471,9 @@ namespace video {
 
   static encoder_t *chosen_encoder;
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
-  int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
-  bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
-  std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
+  static int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
+  static bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
+  static std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
 
   /**
    * @brief Recreate a display capture object after a capture failure.
@@ -3263,7 +3265,23 @@ namespace video {
     return true;
   }
 
-  int probe_encoders() {
+  static std::mutex encoder_capabilities_mutex;
+  static std::condition_variable encoder_probe_completed;
+  static encoder_capabilities_t encoder_capabilities;
+
+  encoder_capabilities_t get_encoder_capabilities() {
+    std::lock_guard lock {encoder_capabilities_mutex};
+    return encoder_capabilities;
+  }
+
+  void wait_for_initial_encoder_probe() {
+    std::unique_lock lock {encoder_capabilities_mutex};
+    encoder_probe_completed.wait(lock, [] {
+      return encoder_capabilities.status != encoder_probe_status::probing;
+    });
+  }
+
+  static int probe_encoders_impl() {
     if (!allow_encoder_probing()) {
       // Error already logged
       return -1;
@@ -3503,6 +3521,26 @@ namespace video {
     }
 
     return 0;
+  }
+
+  int probe_encoders() {
+    const auto result = probe_encoders_impl();
+    {
+      std::lock_guard lock {encoder_capabilities_mutex};
+      if (result == 0) {
+        encoder_capabilities = {
+          encoder_probe_status::ready,
+          active_hevc_mode,
+          active_av1_mode,
+          last_encoder_probe_supported_ref_frames_invalidation,
+          last_encoder_probe_supported_yuv444_for_codec
+        };
+      } else {
+        encoder_capabilities = {encoder_probe_status::failed};
+      }
+    }
+    encoder_probe_completed.notify_all();
+    return result;
   }
 
   // Linux only declaration

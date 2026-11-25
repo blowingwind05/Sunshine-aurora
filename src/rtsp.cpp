@@ -967,15 +967,16 @@ namespace rtsp_stream {
     ss << "a=x-ss-general.encryptionSupported:" << encryption_flags_supported << std::endl;
     ss << "a=x-ss-general.encryptionRequested:" << encryption_flags_requested << std::endl;
 
-    if (video::last_encoder_probe_supported_ref_frames_invalidation) {
+    const auto encoder = video::get_encoder_capabilities();
+    if (encoder.ref_frames_invalidation) {
       ss << "a=x-nv-video[0].refPicInvalidation:1"sv << std::endl;
     }
 
-    if (video::active_hevc_mode != 1) {
+    if (encoder.hevc_mode != 1) {
       ss << "sprop-parameter-sets=AAAAAU"sv << std::endl;
     }
 
-    if (video::active_av1_mode != 1) {
+    if (encoder.av1_mode != 1) {
       ss << "a=rtpmap:98 AV1/90000"sv << std::endl;
     }
 
@@ -1301,14 +1302,15 @@ namespace rtsp_stream {
       config.monitor.bitrate = (int) configuredBitrateKbps;
     }
 
-    if (config.monitor.videoFormat == 1 && video::active_hevc_mode == 1) {
+    const auto encoder = video::get_encoder_capabilities();
+    if (config.monitor.videoFormat == 1 && encoder.hevc_mode == 1) {
       BOOST_LOG(warning) << "HEVC is disabled, yet the client requested HEVC"sv;
 
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
       return;
     }
 
-    if (config.monitor.videoFormat == 2 && video::active_av1_mode == 1) {
+    if (config.monitor.videoFormat == 2 && encoder.av1_mode == 1) {
       BOOST_LOG(warning) << "AV1 is disabled, yet the client requested AV1"sv;
 
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
