@@ -539,9 +539,11 @@ int main(int argc, char *argv[]) {
     BOOST_LOG(warning) << "No gamepad input is available"sv;
   }
 
+#ifndef AURORA_SUNSHINE_HOST
   if (video::probe_encoders()) {
     BOOST_LOG(error) << "Video failed to find working encoder"sv;
   }
+#endif
 
   if (http::init()) {
     BOOST_LOG(fatal) << "HTTP interface failed to initialize"sv;
@@ -572,6 +574,13 @@ int main(int argc, char *argv[]) {
   std::jthread httpThread {nvhttp::start};
   std::jthread configThread {confighttp::start};
   std::jthread rtspThread {rtsp_stream::start};
+
+#ifdef AURORA_SUNSHINE_HOST
+  // Serve discovery and settings during the probe, keeping capture setup on the main thread.
+  if (video::probe_encoders()) {
+    BOOST_LOG(error) << "Video failed to find working encoder"sv;
+  }
+#endif
 
 #ifdef _WIN32
   // If we're using the default port and GameStream is enabled, warn the user

@@ -679,9 +679,22 @@ namespace video {
   using hdr_info_t = std::unique_ptr<hdr_info_raw_t>;
 
   extern int active_hevc_mode;
-  extern int active_av1_mode;
-  extern bool last_encoder_probe_supported_ref_frames_invalidation;
-  extern std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
+
+  enum class encoder_probe_status { probing, ready, failed };
+
+  struct encoder_capabilities_t {
+    encoder_probe_status status = encoder_probe_status::probing;
+    int hevc_mode = 1;
+    int av1_mode = 1;
+    bool ref_frames_invalidation = false;
+    std::array<bool, 3> yuv444 = {};  // H.264, HEVC, AV1
+  };
+
+  // A coherent copy from the most recent completed probe, including its status.
+  encoder_capabilities_t get_encoder_capabilities();
+
+  // Wait for the initial probe to finish, even if it finds no usable encoder.
+  void wait_for_initial_encoder_probe();
 
   /**
    * @brief Resolve a client-requested dynamic range against probed encoder capabilities.
