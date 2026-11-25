@@ -1,8 +1,4 @@
 # macos specific target definitions
-option(AURORA_SUNSHINE_HOST "Build the macOS host companion managed by Aurora" OFF)
-if(AURORA_SUNSHINE_HOST)
-    target_compile_definitions(sunshine PRIVATE AURORA_SUNSHINE_HOST=1)
-endif()
 
 option(AURORA_MACOS_PRIVACY_PREVIEW "Enable Aurora's experimental macOS privacy curtain" OFF)
 if(AURORA_MACOS_PRIVACY_PREVIEW)
@@ -13,10 +9,10 @@ if(AURORA_MACOS_PRIVACY_PREVIEW)
     set(aurora_privacy_sources
         "${CMAKE_SOURCE_DIR}/src/platform/macos/aurora_privacy.mm"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_capture.mm")
-    target_sources(sunshine PRIVATE ${aurora_privacy_sources})
+    target_sources(${sunshine_engine_target} PRIVATE ${aurora_privacy_sources})
     set_source_files_properties(${aurora_privacy_sources} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-    target_compile_definitions(sunshine PRIVATE AURORA_MACOS_PRIVACY_PREVIEW=1)
-    target_link_libraries(sunshine ${SCREEN_CAPTURE_KIT_LIBRARY})
+    target_compile_definitions(${sunshine_engine_target} PRIVATE AURORA_MACOS_PRIVACY_PREVIEW=1)
+    target_link_libraries(${sunshine_engine_target} ${SCREEN_CAPTURE_KIT_LIBRARY})
 endif()
 
 if (SUNSHINE_BUILD_HOMEBREW)
@@ -46,5 +42,5 @@ target_link_options(sunshine PRIVATE -Wl,-U,_CGPreflightScreenCaptureAccess -Wl,
 
 if(AURORA_SUNSHINE_HOST)
     find_library(AURORA_CORE_SERVICES CoreServices REQUIRED)
-    target_link_libraries(sunshine ${AURORA_CORE_SERVICES})
+    target_link_libraries(${sunshine_engine_target} ${AURORA_CORE_SERVICES})
 endif()

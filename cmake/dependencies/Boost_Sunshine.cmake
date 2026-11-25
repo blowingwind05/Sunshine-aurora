@@ -72,7 +72,7 @@ if(NOT Boost_FOUND)
                 Boost
                 URL ${BOOST_URL}
                 URL_HASH ${BOOST_HASH}
-                PATCH_COMMAND /usr/bin/patch -t -p1 -i "${AURORA_BOOST_LOCALE_PATCH}"
+                PATCH_COMMAND /usr/bin/patch -t -p1 -i "${CMAKE_CURRENT_LIST_DIR}/Boost-Locale-1.89-CMake.patch"
                 SYSTEM  # requires CMake 3.25+
                 OVERRIDE_FIND_PACKAGE  # requires CMake 3.24+, but we have a macro to handle it for other versions
         )

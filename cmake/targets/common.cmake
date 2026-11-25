@@ -1,13 +1,26 @@
 # common target definitions
 # this file will also load platform specific macros
 
+option(AURORA_SUNSHINE_HOST "Build the host companion managed by Aurora" OFF)
+set(sunshine_engine_target sunshine)
+set(sunshine_app_sources ${SUNSHINE_TARGET_FILES})
+if(AURORA_SUNSHINE_HOST)
+    add_library(aurora_sunshine_engine STATIC ${SUNSHINE_TARGET_FILES})
+    target_compile_definitions(aurora_sunshine_engine PRIVATE AURORA_SUNSHINE_HOST=1)
+    set(sunshine_engine_target aurora_sunshine_engine)
+    set(sunshine_app_sources src/AuroraHostMain.cpp src/AuroraHostBootstrap.cpp)
+endif()
+
 if(APPLE AND NOT SUNSHINE_BUILD_HOMEBREW)
-    add_executable(sunshine MACOSX_BUNDLE ${SUNSHINE_TARGET_FILES})
+    add_executable(sunshine MACOSX_BUNDLE ${sunshine_app_sources})
 else()
-    add_executable(sunshine ${SUNSHINE_TARGET_FILES})
+    add_executable(sunshine ${sunshine_app_sources})
+endif()
+if(AURORA_SUNSHINE_HOST)
+    target_link_libraries(sunshine aurora_sunshine_engine)
 endif()
 foreach(dep ${SUNSHINE_TARGET_DEPENDENCIES})
-    add_dependencies(sunshine ${dep})  # compile these before sunshine
+    add_dependencies(${sunshine_engine_target} ${dep})
 endforeach()
 
 # platform specific target definitions
@@ -23,8 +36,8 @@ elseif(UNIX)
     endif()
 endif()
 
-target_link_libraries(sunshine ${SUNSHINE_EXTERNAL_LIBRARIES} ${EXTRA_LIBS})
-target_compile_definitions(sunshine PUBLIC ${SUNSHINE_DEFINITIONS})
+target_link_libraries(${sunshine_engine_target} ${SUNSHINE_EXTERNAL_LIBRARIES} ${EXTRA_LIBS})
+target_compile_definitions(${sunshine_engine_target} PUBLIC ${SUNSHINE_DEFINITIONS})
 
 # CLion complains about unknown flags after running cmake, and cannot add symbols to the index for cuda files
 if(CUDA_INHERIT_COMPILE_OPTIONS)
@@ -33,7 +46,7 @@ if(CUDA_INHERIT_COMPILE_OPTIONS)
     endforeach()
 endif()
 
-target_compile_options(sunshine PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>;$<$<COMPILE_LANGUAGE:CUDA>:${SUNSHINE_COMPILE_OPTIONS_CUDA};-std=c++17>)  # cmake-lint: disable=C0301
+target_compile_options(${sunshine_engine_target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>;$<$<COMPILE_LANGUAGE:CUDA>:${SUNSHINE_COMPILE_OPTIONS_CUDA};-std=c++17>)  # cmake-lint: disable=C0301
 target_link_options(sunshine PRIVATE ${SUNSHINE_LINK_OPTIONS})
 
 # Homebrew build fails the vite build if we set these environment variables

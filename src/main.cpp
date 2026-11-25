@@ -26,7 +26,7 @@
 
 // lib includes
 #ifdef AURORA_SUNSHINE_HOST
-  #include <openssl/crypto.h>
+  #include "AuroraHostEntry.h"
 #endif
 #include <rs.h>
 #ifdef _WIN32
@@ -34,9 +34,6 @@
 #endif
 
 // local includes
-#ifdef AURORA_SUNSHINE_HOST
-  #include "aurora_parent_lifetime.h"
-#endif
 #include "confighttp.h"
 #include "display_device.h"
 #include "entry_handler.h"
@@ -198,56 +195,23 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
  * @param argv The arguments.
  * @return Process or platform callback exit code.
  */
-int main(int argc, char *argv[]) {
 #ifdef AURORA_SUNSHINE_HOST
-  if (argc == 2 && std::strcmp(argv[1], "--aurora-runtime-info") == 0) {
-    std::cout << "aurora-host/1" << std::endl;
-    return 0;
-  }
-  aurora::parent_lifetime parent;
-  if (!parent) {
-    return 1;
-  }
+bool auroraHostProfileReady() {
+  #ifdef _WIN32
+  return !platf::aurora_profile().empty();
+  #else
+  return !platf::appdata().empty();
+  #endif
+}
+
+int runAuroraHost(AuroraHostBootstrap &bootstrap, int argc, char *argv[]) {
+#else
+int main(int argc, char *argv[]) {
 #endif
 #ifdef __linux__
   const bool privileged_execution = getauxval(AT_SECURE) != 0 || platf::has_elevated_privileges(true);
   if (privileged_execution && !platf::sanitize_process_environment()) {
     std::cerr << "Failed to sanitize the environment for privileged execution: " << std::strerror(errno) << '\n';
-    return 1;
-  }
-#endif
-
-#ifdef AURORA_SUNSHINE_HOST
-  // The platform-specific managed profile and parent checks have already passed.
-  std::string aurora_admin_password(64, '\0');
-  const auto clear_admin_password = util::fail_guard([&]() {
-    OPENSSL_cleanse(aurora_admin_password.data(), aurora_admin_password.size());
-  });
-  #ifdef _WIN32
-  const auto admin_pipe = GetStdHandle(STD_INPUT_HANDLE);
-  if (GetFileType(admin_pipe) != FILE_TYPE_PIPE) {
-    std::cerr << "Aurora requires an administration password pipe.\n";
-    return 1;
-  }
-  #endif
-  // Read only the fixed frame. On macOS the same pipe stays open to watch for parent exit.
-  std::size_t password_bytes = 0;
-  while (password_bytes < aurora_admin_password.size()) {
-    auto *next = aurora_admin_password.data() + password_bytes;
-    const auto remaining = aurora_admin_password.size() - password_bytes;
-  #ifdef _WIN32
-    DWORD received = 0;
-    if (!ReadFile(admin_pipe, next, static_cast<DWORD>(remaining), &received, nullptr)) break;
-  #else
-    const auto received = read(STDIN_FILENO, next, remaining);
-    if (received < 0 && errno == EINTR) continue;
-  #endif
-    if (received <= 0) break;
-    password_bytes += static_cast<std::size_t>(received);
-  }
-  if (password_bytes != aurora_admin_password.size() ||
-      aurora_admin_password.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
-    std::cerr << "Aurora requires a 64-digit hexadecimal administration password.\n";
     return 1;
   }
 #endif
@@ -319,9 +283,6 @@ int main(int argc, char *argv[]) {
   if (config::parse(argc, argv)) {
     return 0;
   }
-#ifdef AURORA_SUNSHINE_HOST
-  config::sunshine.flags.reset(config::flag::UPNP);
-#endif
 
 #ifdef AURORA_SUNSHINE_HOST
   config::sunshine.flags.reset(config::flag::UPNP);
@@ -361,7 +322,7 @@ int main(int argc, char *argv[]) {
   }
 
 #ifdef AURORA_SUNSHINE_HOST
-  // The upstream default shares the pairing state file. Keep Aurora's account separate.
+  // Keep the local management account separate from the shared pairing state.
   const auto &credentials_file = config::sunshine.credentials_file;
   const auto &state_file = config::nvhttp.file_state;
   std::error_code credentials_error;
@@ -371,9 +332,8 @@ int main(int argc, char *argv[]) {
     BOOST_LOG(fatal) << "Aurora requires a separate administration credentials file"sv;
     return 1;
   }
-  const auto saved = http::save_user_creds(credentials_file, "aurora-local", aurora_admin_password);
-  OPENSSL_cleanse(aurora_admin_password.data(), aurora_admin_password.size());
-  aurora_admin_password.clear();
+  const auto saved = http::save_user_creds(credentials_file, "aurora-local", bootstrap.password());
+  bootstrap.clearPassword();
   if (saved) {
     BOOST_LOG(fatal) << "Could not provision Aurora's private administration account"sv;
     return 1;
@@ -623,7 +583,7 @@ int main(int argc, char *argv[]) {
 #ifdef AURORA_SUNSHINE_HOST
   std::jthread aurora_shutdown {[&](std::stop_token stop) {
     while (!stop.stop_requested() && !shutdown_event->peek()) {
-      if (parent.wait_for_stop()) {
+      if (bootstrap.waitForStop()) {
         if (!shutdown_event->peek()) {
           lifetime::exit_sunshine(0, true);
         }
