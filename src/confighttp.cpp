@@ -1778,6 +1778,9 @@ namespace confighttp {
         {"id", pairing.id},
         {"name", pairing.name},
         {"address", pairing.address},
+#ifdef AURORA_SUNSHINE_HOST
+        {"sourcePort", pairing.source_port},
+#endif
       });
     }
     send_response(response, output_tree);

@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -154,6 +155,7 @@ namespace nvhttp {
       std::string id = {};  ///< Unguessable identifier used by the Web UI to approve this session.
       std::string device_name = {};  ///< Untrusted device name reported by the pairing client.
       std::string address = {};  ///< Network address from which the pairing request originated.
+      std::uint16_t source_port = 0;
       std::chrono::steady_clock::time_point expires_at = std::chrono::steady_clock::time_point::max();  ///< Deadline for completing this pairing session.
     } async_insert_pin;  ///< Async insert pin.
 
@@ -171,6 +173,7 @@ namespace nvhttp {
     std::string id;  ///< Unguessable approval identifier.
     std::string name;  ///< Untrusted device name reported by the pairing client.
     std::string address;  ///< Network address from which the request originated.
+    std::uint16_t source_port = 0;
   };
 
   /**
