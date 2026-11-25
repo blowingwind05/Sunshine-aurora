@@ -365,8 +365,26 @@ namespace nvhttp {
    * @examples
    * nvhttp::erase_all_clients();
    * @examples_end
+   * @return True when the removal was persisted.
    */
-  void erase_all_clients();
+  bool erase_all_clients();
+
+#ifdef AURORA_SUNSHINE_HOST
+  /** @brief Result of a local request to authorize a client from Tailscale. */
+  enum class tailnet_grant_result { accepted, invalid_proof, revoked, conflict, unavailable };
+
+  /**
+   * @brief Verify a Tailscale-scoped client proof and grant GameStream access.
+   * @param name Client display name supplied by the local supervisor.
+   * @param challenge_hex Lowercase hex challenge issued on the authenticated channel.
+   * @param certificate_hex Lowercase hex DER client leaf certificate.
+   * @param signature_hex Lowercase hex signature of the Aurora proof transcript.
+   * @return The outcome of proof verification, scope binding, and state persistence.
+   * @note The supervisor verifies the node and owns the challenge lifetime and single use.
+   */
+  tailnet_grant_result grant_tailnet_client(std::string_view name,
+    std::string_view challenge_hex, std::string_view certificate_hex, std::string_view signature_hex);
+#endif
 
 #ifdef SUNSHINE_TESTS
   /**

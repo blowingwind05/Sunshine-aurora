@@ -10,6 +10,7 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -40,6 +41,9 @@
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
+#ifdef AURORA_SUNSHINE_HOST
+  #include "aurora_client_proof.h"
+#endif
 #include "platform/common.h"
 #include "process.h"
 #include "rtsp.h"
@@ -58,6 +62,9 @@ namespace nvhttp {
   namespace pt = boost::property_tree;
 
   crypto::cert_chain_t cert_chain;  ///< Enabled paired-client certificates accepted by Sunshine's GameStream HTTPS server.
+#ifdef AURORA_SUNSHINE_HOST
+  static std::optional<Aurora::ClientProof::CertificateDigest> tailnet_host_fingerprint;  ///< TLS leaf digest under the paired-client mutex.
+#endif
 
   /**
    * @brief Get the mutex protecting paired-client authorization state.
@@ -90,7 +97,7 @@ namespace nvhttp {
       context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
     }
 
-#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+#ifdef AURORA_SUNSHINE_HOST
     crypto::x509_t peer_certificate(const Request &request) {
       // Simple-Web-Server does not expose the TLS socket through Request. Match
       // both ends of its live TCP connection under the server's connection lock.
@@ -206,6 +213,15 @@ namespace nvhttp {
     std::string uuid;  ///< Persistent Moonlight client UUID associated with the certificate.
     std::string cert;  ///< Certificate PEM string or path.
     bool enabled = true;  ///< Whether this persisted client entry may connect.
+    std::string tailnet_scope;  ///< Stable authorization scope for Aurora-managed credentials.
+    bool unpaired = false;  ///< Retained revocation record hidden from the active client list.
+    std::chrono::steady_clock::time_point tailnet_until {};  ///< In-memory expiry cleared on restart.
+
+    /** @brief Check whether the stored client is currently allowed to authenticate. */
+    bool authorized() const {
+      return enabled && !unpaired &&
+        (tailnet_scope.empty() || std::chrono::steady_clock::now() < tailnet_until);
+    }
   };
 
   /**
@@ -286,42 +302,76 @@ namespace nvhttp {
 
   /**
    * @brief Persist the current state to its backing store.
+   * @return True when the updated state was written.
    */
-  void save_state() {
+  bool save_state() {
     pt::ptree root;
 
-    if (fs::exists(config::nvhttp.file_state)) {
+    std::error_code status_error;
+    const bool has_existing_state = fs::exists(config::nvhttp.file_state, status_error);
+    if (status_error) {
+      BOOST_LOG(error) << "Couldn't access "sv << config::nvhttp.file_state << ": "sv << status_error.message();
+      return false;
+    }
+    if (has_existing_state) {
       try {
         pt::read_json(config::nvhttp.file_state, root);
       } catch (std::exception &e) {
         BOOST_LOG(error) << "Couldn't read "sv << config::nvhttp.file_state << ": "sv << e.what();
-        return;
+        return false;
       }
     }
 
     root.erase("root"s);
 
     root.put("root.uniqueid", http::unique_id);
-    client_t &client = client_root;
-    pt::ptree node;
-
     pt::ptree named_cert_nodes;
-    for (auto &named_cert : client.named_devices) {
+    for (const auto &named_cert : client_root.named_devices) {
       pt::ptree named_cert_node;
       named_cert_node.put("name"s, named_cert.name);
       named_cert_node.put("cert"s, named_cert.cert);
       named_cert_node.put("uuid"s, named_cert.uuid);
       named_cert_node.put("enabled"s, named_cert.enabled);
+      if (!named_cert.tailnet_scope.empty()) {
+        named_cert_node.put("aurora_tailnet_scope", named_cert.tailnet_scope);
+        named_cert_node.put("aurora_unpaired", named_cert.unpaired);
+      }
       named_cert_nodes.push_back(std::make_pair(""s, named_cert_node));
     }
     root.add_child("root.named_devices"s, named_cert_nodes);
 
+    fs::path temporary;
     try {
+#ifdef AURORA_SUNSHINE_HOST
+      const fs::path target {config::nvhttp.file_state};
+      temporary = target;
+      temporary += "." + uuid_util::uuid_t::generate().string() + ".tmp";
+      std::ofstream output(temporary, std::ios::out | std::ios::trunc);
+      output.exceptions(std::ios::badbit | std::ios::failbit);
+  #ifndef _WIN32
+      fs::permissions(temporary, fs::perms::owner_read | fs::perms::owner_write);
+  #endif
+      pt::write_json(output, root);
+      output.close();
+  #ifdef _WIN32
+      if (!MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
+      }
+  #else
+      fs::rename(temporary, target);
+  #endif
+#else
       pt::write_json(config::nvhttp.file_state, root);
+#endif
     } catch (std::exception &e) {
       BOOST_LOG(error) << "Couldn't write "sv << config::nvhttp.file_state << ": "sv << e.what();
-      return;
+      if (!temporary.empty()) {
+        std::error_code error;
+        fs::remove(temporary, error);
+      }
+      return false;
     }
+    return true;
   }
 
   /**
@@ -343,7 +393,7 @@ namespace nvhttp {
   void rebuild_client_cert_chain() {
     cert_chain.clear();
     for (const auto &named_cert : client_root.named_devices) {
-      if (!named_cert.enabled) {
+      if (!named_cert.enabled || named_cert.unpaired) {
         continue;
       }
 
@@ -371,7 +421,7 @@ namespace nvhttp {
         continue;
       }
 
-      if (matched || !named_cert.enabled) {
+      if (matched || !named_cert.authorized()) {
         return false;
       }
       matched = true;
@@ -448,6 +498,8 @@ namespace nvhttp {
         named_cert.cert = el.get_child("cert").get_value<std::string>();
         named_cert.uuid = el.get_child("uuid").get_value<std::string>();
         named_cert.enabled = el.get<bool>("enabled", true);
+        named_cert.tailnet_scope = el.get<std::string>("aurora_tailnet_scope", "");
+        named_cert.unpaired = el.get<bool>("aurora_unpaired", false);
         client.named_devices.emplace_back(named_cert);
       }
     }
@@ -483,6 +535,11 @@ namespace nvhttp {
     named_cert.uuid = uuid_util::uuid_t::generate().string();
 
     std::lock_guard lock {client_auth_mutex()};
+    if (std::ranges::any_of(client_root.named_devices, [&named_cert](const auto &entry) {
+          return !entry.tailnet_scope.empty() && entry.cert == named_cert.cert;
+        })) {
+      return {};
+    }
     client_root.named_devices.emplace_back(std::move(named_cert));
     rebuild_client_cert_chain();
 
@@ -491,6 +548,105 @@ namespace nvhttp {
     }
     return client_root.named_devices.back().uuid;
   }
+
+#ifdef AURORA_SUNSHINE_HOST
+  /**
+   * @brief Check canonical lowercase hex and the decoded field bound.
+   * @param hex Encoded field supplied by the local supervisor.
+   * @param max_bytes Largest decoded value allowed for the field.
+   * @return True when the field can be decoded within its limit.
+   */
+  static bool valid_proof_hex(std::string_view hex, std::size_t max_bytes) {
+    return !hex.empty() && hex.size() % 2 == 0 && hex.size() / 2 <= max_bytes &&
+      std::ranges::all_of(hex, [](char byte) {
+        return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+      });
+  }
+
+  tailnet_grant_result grant_tailnet_client(std::string_view name,
+    std::string_view challenge_hex, std::string_view certificate_hex, std::string_view signature_hex) {
+    using namespace Aurora::ClientProof;
+    using result = tailnet_grant_result;
+    if (!is_valid_pairing_name(name) || challenge_hex.size() != ChallengeSize * 2 ||
+        !valid_proof_hex(challenge_hex, ChallengeSize) ||
+        !valid_proof_hex(certificate_hex, MaxCertificateBytes) ||
+        !valid_proof_hex(signature_hex, MaxSignatureBytes)) {
+      return result::invalid_proof;
+    }
+
+    const auto challenge_bytes = util::from_hex_vec(std::string {challenge_hex}, true);
+    Challenge challenge {};
+    std::ranges::copy(challenge_bytes, challenge.begin());
+    if (std::all_of(challenge.begin(), challenge.begin() + DigestSize, [](auto byte) { return byte == 0; }) ||
+        std::all_of(challenge.end() - DigestSize, challenge.end(), [](auto byte) { return byte == 0; })) {
+      return result::invalid_proof;
+    }
+
+    const auto der = util::from_hex_vec(std::string {certificate_hex}, true);
+    const auto *cursor = reinterpret_cast<const unsigned char *>(der.data());
+    const auto *end = cursor + der.size();
+    crypto::x509_t cert {d2i_X509(nullptr, &cursor, static_cast<long>(der.size()))};
+    if (!cert || cursor != end ||
+        X509_cmp_current_time(X509_get0_notBefore(cert.get())) >= 0 ||
+        X509_cmp_current_time(X509_get0_notAfter(cert.get())) <= 0) {
+      return result::invalid_proof;
+    }
+
+    const auto message = transcript(challenge, crypto::hash(der));
+    const std::string_view proof {reinterpret_cast<const char *>(message.data()), message.size()};
+    if (!crypto::verify256(cert, proof, util::from_hex_vec(std::string {signature_hex}, true))) {
+      return result::invalid_proof;
+    }
+    auto pem = crypto::pem(cert);
+    if (pem.empty()) {
+      return result::invalid_proof;
+    }
+    const std::string scope {challenge_hex.substr(4 * DigestSize)};
+
+    std::lock_guard lock {client_auth_mutex()};
+    if (!tailnet_host_fingerprint || config::sunshine.flags[config::flag::FRESH_STATE]) {
+      return result::unavailable;
+    }
+    if (!std::equal(tailnet_host_fingerprint->begin(), tailnet_host_fingerprint->end(),
+        challenge.begin() + DigestSize)) {
+      return result::invalid_proof;
+    }
+
+    named_cert_t *matched = nullptr;
+    for (auto &entry : client_root.named_devices) {
+      const bool same_certificate = entry.cert == pem;
+      const bool same_scope = entry.tailnet_scope == scope;
+      if (!same_certificate && !same_scope) {
+        continue;
+      }
+      if (!entry.enabled || entry.unpaired) {
+        return result::revoked;
+      }
+      if (matched || !same_certificate || (!entry.tailnet_scope.empty() && !same_scope)) {
+        return result::conflict;
+      }
+      matched = &entry;
+    }
+
+    const auto until = std::chrono::steady_clock::now() + std::chrono::minutes {5};
+    if (matched) {
+      if (!matched->tailnet_scope.empty()) {
+        matched->tailnet_until = until;
+      }
+      return result::accepted;
+    }
+
+    auto &clients = client_root.named_devices;
+    clients.push_back({std::string {name}, uuid_util::uuid_t::generate().string(), std::move(pem), true,
+      scope, false, until});
+    if (!save_state()) {
+      clients.pop_back();
+      return result::unavailable;
+    }
+    rebuild_client_cert_chain();
+    return result::accepted;
+  }
+#endif
 
   /**
    * @brief Create launch session.
@@ -1339,6 +1495,9 @@ namespace nvhttp {
     nlohmann::json named_cert_nodes = nlohmann::json::array();
     std::lock_guard lock {client_auth_mutex()};
     for (const auto &named_cert : client_root.named_devices) {
+      if (named_cert.unpaired) {
+        continue;
+      }
       nlohmann::json named_cert_node;
       named_cert_node["name"] = named_cert.name;
       named_cert_node["uuid"] = named_cert.uuid;
@@ -1872,6 +2031,15 @@ namespace nvhttp {
   void setup(const std::string &pkey, const std::string &cert) {
     conf_intern.pkey = pkey;
     conf_intern.servercert = cert;
+#ifdef AURORA_SUNSHINE_HOST
+    auto leaf = crypto::x509(cert);
+    Aurora::ClientProof::CertificateDigest fingerprint {};
+    unsigned int length = 0;
+    const bool available = leaf && X509_digest(leaf.get(), EVP_sha256(), fingerprint.data(), &length) == 1 &&
+      length == fingerprint.size();
+    std::lock_guard lock {client_auth_mutex()};
+    tailnet_host_fingerprint = available ? std::optional {fingerprint} : std::nullopt;
+#endif
   }
 
   /**
@@ -1883,7 +2051,7 @@ namespace nvhttp {
    */
   std::pair<bool, std::string> get_client_status(const std::string_view cert_pem);
 
-#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+#ifdef AURORA_SUNSHINE_HOST
   std::optional<paired_identity_t> aurora_verified_peer(https_server_t &server, const https_server_t::Request &request) {
     auto cert = server.peer_certificate(request);
     if (!cert) return std::nullopt;
@@ -1893,7 +2061,9 @@ namespace nvhttp {
     auto pem = crypto::pem(cert);
     return paired_identity_t {pem, get_client_status(pem).second};
   }
+#endif
 
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   void aurora_session_privacy(https_server_t &server, resp_https_t response, req_https_t request) {
     using action_t = rtsp_stream::aurora_privacy_action;
     const auto &query = request->query_string;
@@ -2016,13 +2186,26 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message"s, "The client is not authorized. Certificate verification failed."s);
     };
 
-    https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
-    https_server.resource["^/serverinfo$"]["GET"] = serverinfo<SunshineHTTPS>;
-    https_server.resource["^/pair$"]["GET"] = [](auto resp, auto req) {
-      pair<SunshineHTTPS>(resp, req);
+#ifdef AURORA_SUNSHINE_HOST
+    const auto authorized = [&https_server](auto handler) {
+      return [&https_server, handler](resp_https_t response, req_https_t request) {
+        if (!aurora_verified_peer(https_server, *request)) {
+          https_server.on_verify_failed(response, request);
+          return;
+        }
+        handler(response, request);
+      };
     };
-    https_server.resource["^/applist$"]["GET"] = applist;
-    https_server.resource["^/appasset$"]["GET"] = appasset;
+#else
+    const auto authorized = [](auto handler) { return handler; };
+#endif
+    https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
+    https_server.resource["^/serverinfo$"]["GET"] = authorized(serverinfo<SunshineHTTPS>);
+    https_server.resource["^/pair$"]["GET"] = authorized([](auto resp, auto req) {
+      pair<SunshineHTTPS>(resp, req);
+    });
+    https_server.resource["^/applist$"]["GET"] = authorized(applist);
+    https_server.resource["^/appasset$"]["GET"] = authorized(appasset);
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
     https_server.resource["^/aurora-session-privacy$"]["POST"] = [&https_server](resp_https_t resp, req_https_t req) {
       aurora_session_privacy(https_server, resp, req);
@@ -2038,17 +2221,17 @@ namespace nvhttp {
     };
 #endif
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
-    https_server.resource["^/aurora-power$"]["POST"] = aurora_power;
+    https_server.resource["^/aurora-power$"]["POST"] = authorized(aurora_power);
     https_server.resource["^/aurora-power$"]["GET"] = [](resp_https_t resp, req_https_t) {
       BOOST_LOG(warning) << "Aurora power request rejected: POST required";
       aurora_text_response(resp, power_status::client_error_method_not_allowed, "POST required", {{"Allow", "POST"}});
     };
 #endif
 #ifdef AURORA_SUNSHINE_HOST
-    https_server.resource["^/aurora-wallpaper$"]["GET"] = aurora_wallpaper;
+    https_server.resource["^/aurora-wallpaper$"]["GET"] = authorized(aurora_wallpaper);
 #endif
     https_server.resource["^/launch$"]["GET"] = [&host_audio, &https_server](auto resp, auto req) {
-#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+#ifdef AURORA_SUNSHINE_HOST
       const auto identity = aurora_verified_peer(https_server, *req);
       if (!identity) {
         https_server.on_verify_failed(resp, req);
@@ -2060,7 +2243,7 @@ namespace nvhttp {
 #endif
     };
     https_server.resource["^/resume$"]["GET"] = [&host_audio, &https_server](auto resp, auto req) {
-#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+#ifdef AURORA_SUNSHINE_HOST
       const auto identity = aurora_verified_peer(https_server, *req);
       if (!identity) {
         https_server.on_verify_failed(resp, req);
@@ -2071,7 +2254,7 @@ namespace nvhttp {
       resume(host_audio, resp, req);
 #endif
     };
-    https_server.resource["^/cancel$"]["GET"] = cancel;
+    https_server.resource["^/cancel$"]["GET"] = authorized(cancel);
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);
@@ -2116,38 +2299,57 @@ namespace nvhttp {
     tcp.join();
   }
 
-  void erase_all_clients() {
+  bool erase_all_clients() {
     std::lock_guard lock {client_auth_mutex()};
-    client_root = {};
+    std::erase_if(client_root.named_devices, [](const named_cert_t &entry) { return entry.tailnet_scope.empty(); });
+    for (auto &entry : client_root.named_devices) {
+      entry.enabled = false;
+      entry.unpaired = true;
+      entry.tailnet_until = {};
+    }
     cert_chain.clear();
-    save_state();
+    return save_state();
   }
 
   bool unpair_client(const std::string_view uuid) {
     std::lock_guard lock {client_auth_mutex()};
     bool removed = false;
     for (auto it = client_root.named_devices.begin(); it != client_root.named_devices.end();) {
-      if ((*it).uuid == uuid) {
-        it = client_root.named_devices.erase(it);
-        removed = true;
-      } else {
+      if (it->uuid != uuid || it->unpaired) {
         ++it;
+        continue;
       }
+      removed = true;
+      if (it->tailnet_scope.empty()) {
+        it = client_root.named_devices.erase(it);
+        continue;
+      }
+      // Keep the node and certificate binding as a revocation record.
+      it->enabled = false;
+      it->unpaired = true;
+      it->tailnet_until = {};
+      ++it;
     }
 
     rebuild_client_cert_chain();
-    save_state();
-    return removed;
+    return removed && save_state();
   }
 
   bool set_client_enabled(const std::string_view uuid, bool enabled) {
     std::lock_guard lock {client_auth_mutex()};
     for (auto &named_cert : client_root.named_devices) {
-      if (named_cert.uuid == uuid) {
+      if (named_cert.uuid == uuid && !named_cert.unpaired) {
+        const bool previous = named_cert.enabled;
         named_cert.enabled = enabled;
+        if (!enabled) {
+          named_cert.tailnet_until = {};
+        }
+        const bool saved = save_state();
+        if (!saved && enabled) {
+          named_cert.enabled = previous;
+        }
         rebuild_client_cert_chain();
-        save_state();
-        return true;
+        return saved;
       }
     }
     return false;
@@ -2159,7 +2361,7 @@ namespace nvhttp {
   std::string get_cert_by_uuid(const std::string_view uuid) {
     std::lock_guard lock {client_auth_mutex()};
     for (const auto &named_cert : client_root.named_devices) {
-      if (named_cert.uuid == uuid) {
+      if (named_cert.uuid == uuid && !named_cert.unpaired) {
         return named_cert.cert;
       }
     }
@@ -2173,7 +2375,7 @@ namespace nvhttp {
     const client_t &client = client_root;
     for (const auto &named_cert : client.named_devices) {
       if (named_cert.cert == cert_pem) {
-        return {named_cert.enabled, named_cert.name};
+        return {named_cert.authorized(), named_cert.name};
       }
     }
     return {true, {}};

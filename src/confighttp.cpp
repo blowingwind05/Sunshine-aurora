@@ -1402,11 +1402,11 @@ namespace confighttp {
 
     print_req(request);
 
-    nvhttp::erase_all_clients();
+    const bool removed = nvhttp::erase_all_clients();
     proc::proc.terminate();
 
     nlohmann::json output_tree;
-    output_tree["status"] = true;
+    output_tree["status"] = removed;
     send_response(response, output_tree);
   }
 
@@ -1474,6 +1474,57 @@ namespace confighttp {
     #endif
   #endif
     send_response(response, privacy);
+  }
+#endif
+
+#ifdef AURORA_SUNSHINE_HOST
+  /**
+   * @brief Accept a client proof from the authenticated local Aurora supervisor.
+   * @param response The HTTP response to hold the grant result.
+   * @param request The loopback request and its bounded JSON fields.
+   */
+  void grantAuroraClient(const resp_https_t &response, const req_https_t &request) {
+    if (!net::normalize_address(request->remote_endpoint().address()).is_loopback()) {
+      response->write(SimpleWeb::StatusCode::client_error_forbidden);
+      return;
+    }
+    if (!authenticate(response, request) ||
+        !validate_csrf_token(response, request, get_client_id(request)) ||
+        !check_content_type(response, request, "application/json")) {
+      return;
+    }
+
+    constexpr std::size_t max_grant_body = 12 * 1024;
+    if (request->content.size() > max_grant_body) {
+      bad_request(response, request, "Client proof is too large");
+      return;
+    }
+    try {
+      std::stringstream body;
+      body << request->content.rdbuf();
+      const auto input = nlohmann::json::parse(body);
+      if (!input.is_object() || input.size() != 4) {
+        bad_request(response, request, "Malformed client proof");
+        return;
+      }
+      using result = nvhttp::tailnet_grant_result;
+      const auto grant = nvhttp::grant_tailnet_client(
+        input.at("name").get<std::string>(),
+        input.at("challenge").get<std::string>(),
+        input.at("certificate").get<std::string>(),
+        input.at("signature").get<std::string>());
+      const char *state = "unavailable";
+      switch (grant) {
+        case result::accepted: state = "accepted"; break;
+        case result::invalid_proof: state = "invalid-proof"; break;
+        case result::revoked: state = "revoked"; break;
+        case result::conflict: state = "conflict"; break;
+        case result::unavailable: break;
+      }
+      send_response(response, {{"status", grant == result::accepted}, {"result", state}});
+    } catch (const nlohmann::json::exception &) {
+      bad_request(response, request, "Malformed client proof");
+    }
   }
 #endif
 
@@ -1795,6 +1846,9 @@ namespace confighttp {
 
     nlohmann::json output_tree;
     output_tree["pairings"] = nlohmann::json::array();
+#ifdef AURORA_SUNSHINE_HOST
+    output_tree["aurora_client_grant"] = true;
+#endif
     for (const auto &pairing : nvhttp::get_pending_pairings()) {
       output_tree["pairings"].push_back({
         {"id", pairing.id},
@@ -2414,6 +2468,9 @@ namespace confighttp {
     server.resource["^/api/clients/update$"]["POST"] = updateClient;
     server.resource["^/api/config$"]["GET"] = getConfig;
     server.resource["^/api/config$"]["POST"] = saveConfig;
+#ifdef AURORA_SUNSHINE_HOST
+    server.resource["^/api/aurora/client-grant$"]["POST"] = grantAuroraClient;
+#endif
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
     server.resource["^/api/aurora/privacy$"]["GET"] = getAuroraPrivacy;
 #endif
