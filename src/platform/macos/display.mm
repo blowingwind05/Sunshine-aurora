@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <optional>
@@ -391,6 +392,42 @@ namespace platf {
 
     return display_names;
   }
+
+#ifdef AURORA_SUNSHINE_HOST
+  std::optional<std::pair<std::size_t, std::size_t>> aurora_capture_size() {
+    // Match video::refresh_displays when starting a new capture. An explicitly
+    // configured output may be woken later, so omit geometry while it is unknown.
+    const auto outputs = display_names(mem_type_e::videotoolbox);
+    if (outputs.empty()) {
+      return std::nullopt;
+    }
+
+    const auto configured = display_device::map_output_name(config::video.output_name);
+    const auto selected = config::video.output_name.empty() ?
+      outputs.begin() : std::find(outputs.begin(), outputs.end(), configured);
+    if (selected == outputs.end()) {
+      return std::nullopt;
+    }
+
+    const auto id = parse_display_id(*selected);
+    if (!id || !CGDisplayIsActive(*id)) {
+      return std::nullopt;
+    }
+
+    const auto mode = CGDisplayCopyDisplayMode(*id);
+    if (!mode) {
+      return std::nullopt;
+    }
+
+    const auto width = CGDisplayModeGetPixelWidth(mode);
+    const auto height = CGDisplayModeGetPixelHeight(mode);
+    CFRelease(mode);
+    if (!width || !height) {
+      return std::nullopt;
+    }
+    return std::pair {width, height};
+  }
+#endif
 
   /**
    * @brief Report whether encoder backends should be probed again before streaming.
