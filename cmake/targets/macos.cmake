@@ -24,3 +24,8 @@ endif()
 
 # Tell linker to dynamically load these symbols at runtime, in case they're unavailable:
 target_link_options(sunshine PRIVATE -Wl,-U,_CGPreflightScreenCaptureAccess -Wl,-U,_CGRequestScreenCaptureAccess)
+
+if(AURORA_SUNSHINE_HOST)
+    find_library(AURORA_CORE_SERVICES CoreServices REQUIRED)
+    target_link_libraries(sunshine ${AURORA_CORE_SERVICES})
+endif()
