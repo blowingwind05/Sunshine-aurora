@@ -1434,6 +1434,23 @@ namespace confighttp {
     send_response(response, output_tree);
   }
 
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  void getAuroraPrivacy(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) return;
+
+    auto vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
+    auto displays = nlohmann::json::array();
+    for (const auto &device : display_device::aurora_virtual_displays()) {
+      displays.push_back({{"id", device.m_device_id}, {"name", device.m_friendly_name}});
+    }
+    const auto &exclusive_display = vars["aurora_privacy_display_id"];
+    const auto &extended_display = vars["aurora_virtual_display_id"];
+    send_response(response, {{"status", true}, {"saved", exclusive_display.empty() ? extended_display : exclusive_display},
+      {"saved_exclusive", !exclusive_display.empty()}, {"active", config::aurora_display_id},
+      {"active_exclusive", config::aurora_display_exclusive}, {"displays", std::move(displays)}});
+  }
+#endif
+
   /**
    * @brief Get the locale setting. This endpoint does not require authentication.
    * @param response The HTTP response object.
@@ -2364,6 +2381,9 @@ namespace confighttp {
     server.resource["^/api/clients/update$"]["POST"] = updateClient;
     server.resource["^/api/config$"]["GET"] = getConfig;
     server.resource["^/api/config$"]["POST"] = saveConfig;
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    server.resource["^/api/aurora/privacy$"]["GET"] = getAuroraPrivacy;
+#endif
     server.resource["^/api/configLocale$"]["GET"] = getLocale;
     server.resource["^/api/covers/([0-9]+)$"]["GET"] = getCover;
     server.resource["^/api/covers/upload$"]["POST"] = uploadCover;

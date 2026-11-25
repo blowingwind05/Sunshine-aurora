@@ -394,6 +394,10 @@ namespace config {
   };
 
   extern video_t video;
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  extern std::string aurora_display_id;
+  extern bool aurora_display_exclusive;
+#endif
   extern audio_t audio;
   extern stream_t stream;
   extern nvhttp_t nvhttp;

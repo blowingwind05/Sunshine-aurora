@@ -23,6 +23,7 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "display_device.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -608,6 +609,11 @@ namespace rtsp_stream {
           auto discarded = launch_event.pop(0s);
           if (discarded) {
             BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+            if (!config::aurora_display_id.empty() && session_count() == 0) {
+              display_device::revert_configuration();
+            }
+#endif
           }
         }
       });
@@ -711,6 +717,16 @@ namespace rtsp_stream {
       // 500ms to allow session cleanup to happen.
       if (session_count() > 0) {
         io_context.run_one_for(500ms);
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+        const auto now = std::chrono::steady_clock::now();
+        if (!config::aurora_display_id.empty() && now >= privacy_check_due) {
+          privacy_check_due = now + 500ms;
+          if (!display_device::aurora_display_ready()) {
+            BOOST_LOG(warning) << "Aurora virtual display configuration changed; ending the stream";
+            clear();
+          }
+        }
+#endif
       } else {
         io_context.run_one();
       }
@@ -733,6 +749,9 @@ namespace rtsp_stream {
     boost::asio::io_context io_context;
     tcp::acceptor acceptor {io_context};
     boost::asio::steady_timer raised_timer {io_context};
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    std::chrono::steady_clock::time_point privacy_check_due {};
+#endif
 
     std::shared_ptr<socket_t> next_socket;
   };
@@ -1072,6 +1091,12 @@ namespace rtsp_stream {
    * @param req Parsed RTSP request being handled.
    */
   void cmd_announce(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    if (!config::aurora_display_id.empty() && !display_device::aurora_display_ready()) {
+      respond(sock, session, nullptr, 503, "VIRTUAL DISPLAY UNAVAILABLE", req->sequenceNumber, {});
+      return;
+    }
+#endif
     OPTION_ITEM option {};
 
     // I know these string literals will not be modified

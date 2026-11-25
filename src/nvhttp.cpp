@@ -1321,6 +1321,25 @@ namespace nvhttp {
     }
   }
 
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  bool aurora_check_display(pt::ptree &tree, bool before_switch) {
+    const auto &target = config::aurora_display_id;
+    if (target.empty()) return true;
+    if (before_switch) {
+      const auto devices = display_device::aurora_virtual_displays();
+      if (std::any_of(devices.begin(), devices.end(), [&](const auto &device) { return device.m_device_id == target; })) return true;
+    } else if (display_device::aurora_display_ready()) {
+      return true;
+    }
+    tree.put("root.<xmlattr>.status_code", 503);
+    tree.put("root.<xmlattr>.status_message", before_switch ? "Aurora: the configured virtual display is unavailable" :
+      "Aurora: could not prepare the selected virtual display");
+    tree.put("root.gamesession", 0);
+    tree.put("root.resume", 0);
+    return false;
+  }
+#endif
+
   /**
    * @brief Launch the requested application for a GameStream session.
    *
@@ -1378,6 +1397,9 @@ namespace nvhttp {
     auto launch_session = make_launch_session(host_audio, args);
 
     if (rtsp_stream::session_count() == 0) {
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      if (!aurora_check_display(tree, true)) return;
+#endif
       // The display should be restored in case something fails as there are no other sessions.
       revert_display_configuration = true;
 
@@ -1385,6 +1407,9 @@ namespace nvhttp {
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
       display_device::configure_display(config::video, *launch_session);
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      if (!aurora_check_display(tree, false)) return;
+#endif
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1450,6 +1475,12 @@ namespace nvhttp {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    bool revert_privacy_configuration = false;
+    auto restore_privacy = util::fail_guard([&]() {
+      if (revert_privacy_configuration) display_device::revert_configuration();
+    });
+#endif
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -1493,10 +1524,17 @@ namespace nvhttp {
     const auto launch_session = make_launch_session(host_audio, args);
 
     if (no_active_sessions) {
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      if (!aurora_check_display(tree, true)) return;
+      revert_privacy_configuration = !config::aurora_display_id.empty();
+#endif
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
       display_device::configure_display(config::video, *launch_session);
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      if (!aurora_check_display(tree, false)) return;
+#endif
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1535,6 +1573,9 @@ namespace nvhttp {
     tree.put("root.resume", 1);
 
     rtsp_stream::launch_session_raise(launch_session);
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    revert_privacy_configuration = false;
+#endif
   }
 
   /**

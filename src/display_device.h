@@ -147,6 +147,10 @@ namespace display_device {
    * @examples_end
    */
   [[nodiscard]] EnumeratedDeviceList enumerate_devices();
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  [[nodiscard]] EnumeratedDeviceList aurora_virtual_displays();
+  [[nodiscard]] bool aurora_display_ready();
+#endif
 
   /**
    * @brief A tag structure indicating that configuration parsing has failed.

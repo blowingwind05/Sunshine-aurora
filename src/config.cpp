@@ -714,6 +714,11 @@ namespace config {
   /**
    * @brief Default video configuration values used before file and CLI overrides.
    */
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  std::string aurora_display_id;
+  bool aurora_display_exclusive;
+#endif
+
   video_t video {
     28,  // qp
 
@@ -1713,6 +1718,20 @@ namespace config {
       }
     }
     bool_f(vars, "dd_config_revert_on_disconnect", video.dd.config_revert_on_disconnect);
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    std::string exclusive_display;
+    string_f(vars, "aurora_privacy_display_id", exclusive_display);
+    string_f(vars, "aurora_virtual_display_id", aurora_display_id);
+    aurora_display_exclusive = !exclusive_display.empty();
+    if (aurora_display_exclusive) aurora_display_id = std::move(exclusive_display);
+    if (!aurora_display_id.empty()) {
+      video.output_name = aurora_display_id;
+      using Mode = video_t::dd_t::config_option_e;
+      video.dd.configuration_option = aurora_display_exclusive ? Mode::ensure_only_display : Mode::ensure_active;
+      video.dd.config_revert_on_disconnect = true;
+      video.dd.config_revert_delay = 0ms;
+    }
+#endif
     generic_f(vars, "dd_mode_remapping", video.dd.mode_remapping, dd::mode_remapping_from_view);
     {
       int value = 0;

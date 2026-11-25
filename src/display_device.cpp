@@ -8,9 +8,11 @@
 // standard includes
 #include <algorithm>
 #include <cctype>
+#include <cwchar>
 #include <mutex>
 #include <regex>
 #include <string_view>
+#include <unordered_set>
 
 // lib includes
 #include <boost/algorithm/string.hpp>
@@ -24,12 +26,16 @@
 #include "audio.h"
 #include "platform/common.h"
 #include "rtsp.h"
+#include "utility.h"
 
 // platform-specific includes
 #ifdef _WIN32
   #include <display_device/windows/settings_manager.h>
   #include <display_device/windows/win_api_layer.h>
   #include <display_device/windows/win_display_device.h>
+  #if defined(AURORA_SUNSHINE_HOST)
+    #include <setupapi.h>
+  #endif
 #endif
 
 #ifdef __APPLE__
@@ -921,6 +927,69 @@ namespace display_device {
       return settings_iface.enumAvailableDevices();
     });
   }
+
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  namespace {
+    bool aurora_is_virtual(const DISPLAYCONFIG_PATH_INFO &path) {
+      if (path.targetInfo.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL) {
+        return true;
+      }
+
+      // An indirect driver may advertise HDMI, so check the adapter, not the monitor's name or EDID.
+      DISPLAYCONFIG_ADAPTER_NAME adapter {};
+      adapter.header = {DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME, sizeof(adapter), path.targetInfo.adapterId, 0};
+      if (DisplayConfigGetDeviceInfo(&adapter.header) != ERROR_SUCCESS) return false;
+
+      auto list = SetupDiCreateDeviceInfoList(nullptr, nullptr);
+      if (list == INVALID_HANDLE_VALUE) return false;
+      auto close = util::fail_guard([&]() { SetupDiDestroyDeviceInfoList(list); });
+      SP_DEVICE_INTERFACE_DATA interface_data {sizeof(SP_DEVICE_INTERFACE_DATA)};
+      if (!SetupDiOpenDeviceInterfaceW(list, adapter.adapterDevicePath, 0, &interface_data)) return false;
+
+      DWORD required = 0;
+      SetupDiGetDeviceInterfaceDetailW(list, &interface_data, nullptr, 0, &required, nullptr);
+      if (required < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)) return false;
+      auto storage = std::make_unique<std::byte[]>(required);
+      auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(storage.get());
+      detail->cbSize = sizeof(*detail);
+      SP_DEVINFO_DATA device {sizeof(SP_DEVINFO_DATA)};
+      if (!SetupDiGetDeviceInterfaceDetailW(list, &interface_data, detail, required, nullptr, &device)) return false;
+
+      wchar_t hardware_ids[512] {};
+      DWORD kind {};
+      if (!SetupDiGetDeviceRegistryPropertyW(list, &device, SPDRP_HARDWAREID, &kind,
+          reinterpret_cast<BYTE *>(hardware_ids), sizeof(hardware_ids) - sizeof(wchar_t), nullptr) ||
+          kind != REG_MULTI_SZ) return false;
+      for (const auto *id = hardware_ids; *id; id += std::wcslen(id) + 1) {
+        if (_wcsicmp(id, L"Root\\MttVDD") == 0 || _wcsicmp(id, L"Root\\SudoMaker\\SudoVDA") == 0) return true;
+      }
+      return false;
+    }
+  }
+
+  EnumeratedDeviceList aurora_virtual_displays() {
+    const WinApiLayer win;
+    const auto paths = win.queryDisplayConfig(QueryType::All);
+    if (!paths) return {};
+    std::unordered_set<std::string> ids;
+    for (const auto &path : paths->m_paths) {
+      if (path.targetInfo.targetAvailable && aurora_is_virtual(path)) ids.insert(win.getDeviceId(path));
+    }
+    auto devices = enumerate_devices();
+    std::erase_if(devices, [&](const auto &device) { return !ids.contains(device.m_device_id); });
+    return devices;
+  }
+
+  bool aurora_display_ready() {
+    const auto &expected = config::aurora_display_id;
+    if (expected.empty()) return false;
+    const WinApiLayer win;
+    const auto paths = win.queryDisplayConfig(QueryType::Active);
+    if (!paths || (config::aurora_display_exclusive && paths->m_paths.size() != 1)) return false;
+    return std::any_of(paths->m_paths.begin(), paths->m_paths.end(),
+      [&](const auto &path) { return win.getDeviceId(path) == expected; });
+  }
+#endif
 
   std::variant<failed_to_parse_tag_t, configuration_disabled_tag_t, SingleDisplayConfiguration> parse_configuration(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
     const auto device_prep {parse_device_prep_option(video_config)};
