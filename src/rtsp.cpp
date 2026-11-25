@@ -1414,7 +1414,13 @@ namespace rtsp_stream {
 
     // Check that any required encryption is enabled
     auto encryption_mode = net::encryption_mode_for_address(sock.remote_endpoint().address());
-    if (encryption_mode == config::ENCRYPTION_MODE_MANDATORY && (config.encryptionFlagsEnabled & (SS_ENC_VIDEO | SS_ENC_AUDIO)) != (SS_ENC_VIDEO | SS_ENC_AUDIO)) {
+    constexpr uint32_t required_encryption = SS_ENC_VIDEO | SS_ENC_AUDIO
+#ifdef AURORA_SUNSHINE_HOST
+      | SS_ENC_CONTROL_V2
+#endif
+      ;
+    if (encryption_mode == config::ENCRYPTION_MODE_MANDATORY &&
+        (config.encryptionFlagsEnabled & required_encryption) != required_encryption) {
       BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
 
       respond(sock, session, &option, 403, "Forbidden", req->sequenceNumber, {});

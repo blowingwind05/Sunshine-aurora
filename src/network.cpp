@@ -196,12 +196,17 @@ namespace net {
   }
 
   int encryption_mode_for_address(boost::asio::ip::address address) {
+#ifdef AURORA_SUNSHINE_HOST
+    (void) address;
+    return config::ENCRYPTION_MODE_MANDATORY;
+#else
     auto nettype = net::from_address(address.to_string());
     if (nettype == net::net_e::PC || nettype == net::net_e::LAN) {
       return config::stream.lan_encryption_mode;
     } else {
       return config::stream.wan_encryption_mode;
     }
+#endif
   }
 
   /**
