@@ -36,6 +36,9 @@ extern "C" {
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+  #include "src/platform/macos/aurora_privacy.h"
+#endif
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
 constexpr int IDX_START_B = 1;  ///< Control-stream message index for the second stream-start packet.
@@ -492,6 +495,10 @@ namespace stream {
     safe::mail_t mail;  ///< Mailbox used to distribute packets and lifecycle events.
 
     std::shared_ptr<input::input_t> input;  ///< Platform input device state for this stream.
+
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+    aurora_privacy::session_ptr privacy;
+#endif
 
     std::jthread audioThread;  ///< Audio thread.
     std::jthread videoThread;  ///< Video thread.
@@ -2228,6 +2235,10 @@ namespace stream {
 
       BOOST_LOG(debug) << "Waiting for video to end..."sv;
       session.videoThread.join();
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+      aurora_privacy::end(session.privacy);
+      session.privacy.reset();
+#endif
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
       session.audioThread.join();
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
@@ -2270,6 +2281,26 @@ namespace stream {
         return -1;
       }
 
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+      if (config::aurora_privacy_screensaver) {
+  #ifdef AURORA_MACOS_PRIVACY_PREVIEW
+        const auto &monitor = session.config.monitor;
+        if (session.client_cert.empty() || monitor.dynamicRange || monitor.chromaSamplingType ||
+            !video::aurora_privacy_uses_videotoolbox()) {
+          BOOST_LOG(error) << "Aurora privacy needs a paired client and an SDR 4:2:0 VideoToolbox stream"sv;
+          return -1;
+        }
+        session.privacy = aurora_privacy::begin(config::video.output_name, monitor.width, monitor.height, monitor.framerate);
+        if (!session.privacy) {
+          BOOST_LOG(error) << "Aurora privacy could not confirm the local curtain and filtered capture"sv;
+          return -1;
+        }
+  #else
+        BOOST_LOG(error) << "Aurora privacy is configured but this macOS host was built without curtain support"sv;
+        return -1;
+  #endif
+      }
+#endif
       session.control.expected_peer_address = addr_string;
       BOOST_LOG(debug) << "Expecting incoming session connections from "sv << addr_string;
 

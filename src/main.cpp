@@ -52,6 +52,9 @@
 #include "system_tray.h"
 #include "upnp.h"
 #include "video.h"
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+  #include "src/platform/macos/aurora_privacy.h"
+#endif
 
 #ifdef __linux__
   #include "platform/common.h"
@@ -161,6 +164,12 @@ constexpr bool tray_is_enabled = false;
  * @param shutdown_event Shutdown event.
  */
 void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) {
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+  if (config::aurora_privacy_screensaver) {
+    aurora_privacy::run_main_loop([&]() { return shutdown_event->peek(); });
+    return;
+  }
+#endif
   bool run_loop = false;
 
   // Conditions that would require the main thread event loop

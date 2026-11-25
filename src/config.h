@@ -394,6 +394,10 @@ namespace config {
   };
 
   extern video_t video;
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  inline constexpr auto aurora_privacy_screensaver_key = "aurora_privacy_screensaver";
+  extern bool aurora_privacy_screensaver;
+#endif
   extern audio_t audio;
   extern stream_t stream;
   extern nvhttp_t nvhttp;

@@ -714,6 +714,10 @@ namespace config {
   /**
    * @brief Default video configuration values used before file and CLI overrides.
    */
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  bool aurora_privacy_screensaver = false;
+#endif
+
   video_t video {
     28,  // qp
 
@@ -1713,6 +1717,11 @@ namespace config {
       }
     }
     bool_f(vars, "dd_config_revert_on_disconnect", video.dd.config_revert_on_disconnect);
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    std::string privacy_screensaver;
+    string_f(vars, aurora_privacy_screensaver_key, privacy_screensaver);
+    aurora_privacy_screensaver = privacy_screensaver == "enabled";
+#endif
     generic_f(vars, "dd_mode_remapping", video.dd.mode_remapping, dd::mode_remapping_from_view);
     {
       int value = 0;

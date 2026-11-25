@@ -1438,6 +1438,22 @@ namespace confighttp {
     send_response(response, output_tree);
   }
 
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  void getAuroraPrivacy(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) return;
+
+    auto vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
+  #ifdef AURORA_MACOS_PRIVACY_PREVIEW
+    constexpr bool supports_screensaver = true;
+  #else
+    constexpr bool supports_screensaver = false;
+  #endif
+    send_response(response, {{"status", true}, {"supports_screensaver", supports_screensaver},
+      {"saved_screensaver", vars[config::aurora_privacy_screensaver_key] == "enabled"},
+      {"active_screensaver", config::aurora_privacy_screensaver}, {"supports_virtual_display", false}});
+  }
+#endif
+
   /**
    * @brief Get the locale setting. This endpoint does not require authentication.
    * @param response The HTTP response object.
@@ -2376,6 +2392,9 @@ namespace confighttp {
     server.resource["^/api/clients/update$"]["POST"] = updateClient;
     server.resource["^/api/config$"]["GET"] = getConfig;
     server.resource["^/api/config$"]["POST"] = saveConfig;
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    server.resource["^/api/aurora/privacy$"]["GET"] = getAuroraPrivacy;
+#endif
     server.resource["^/api/configLocale$"]["GET"] = getLocale;
     server.resource["^/api/covers/([0-9]+)$"]["GET"] = getCover;
     server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
