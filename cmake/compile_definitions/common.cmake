@@ -57,14 +57,9 @@ endif()
 # platform specific compile definitions
 if(WIN32)
     include(${CMAKE_MODULE_PATH}/compile_definitions/windows.cmake)
-elseif(UNIX)
+elseif(APPLE)
     include(${CMAKE_MODULE_PATH}/compile_definitions/unix.cmake)
-
-    if(APPLE)
-        include(${CMAKE_MODULE_PATH}/compile_definitions/macos.cmake)
-    else()
-        include(${CMAKE_MODULE_PATH}/compile_definitions/linux.cmake)
-    endif()
+    include(${CMAKE_MODULE_PATH}/compile_definitions/macos.cmake)
 endif()
 
 # libvirtualhid
@@ -240,11 +235,4 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         ${OPENSSL_LIBRARIES}
         ${PLATFORM_LIBRARIES})
 
-# tray icon
-if(SUNSHINE_ENABLE_TRAY)
-    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES tray::tray)
-else()
-    set(SUNSHINE_TRAY 0)
-    message(STATUS "Tray icon disabled")
-endif()
-list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_TRAY=${SUNSHINE_TRAY})
+list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_TRAY=0)

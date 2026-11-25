@@ -9,6 +9,10 @@ project(Sunshine VERSION 0.0.0
         DESCRIPTION "Self-hosted game stream host for Moonlight"
         HOMEPAGE_URL "https://app.lizardbyte.dev/Sunshine")
 
+if(NOT WIN32 AND NOT APPLE)
+    message(FATAL_ERROR "The Aurora Sunshine fork supports Windows and macOS.")
+endif()
+
 # Minimum separately installed Virtual HID Driver version supported by this build.
 set(LIBVIRTUALHID_MINIMUM_VERSION "2026.914.1218.10")
 list(APPEND SUNSHINE_DEFINITIONS LIBVIRTUALHID_MINIMUM_VERSION="${LIBVIRTUALHID_MINIMUM_VERSION}")
@@ -55,7 +59,6 @@ include(${CMAKE_MODULE_PATH}/prep/build_version.cmake)
 
 # cmake build flags
 include(${CMAKE_MODULE_PATH}/prep/options.cmake)
-include(${CMAKE_MODULE_PATH}/prep/static_qt.cmake)
 
 # initial prep
 include(${CMAKE_MODULE_PATH}/prep/init.cmake)

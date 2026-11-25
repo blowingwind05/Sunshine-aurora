@@ -94,11 +94,6 @@ add_custom_target(web-ui ALL
         COMMAND "${CMAKE_COMMAND}" -E env "${NPM_PATH}" "SUNSHINE_BUILD_HOMEBREW=${NPM_BUILD_HOMEBREW}" "SUNSHINE_SOURCE_ASSETS_DIR=${NPM_SOURCE_ASSETS_DIR}" "SUNSHINE_ASSETS_DIR=${NPM_ASSETS_DIR}" ${NPM_COMMAND} "${NPM}" run build  # cmake-lint: disable=C0301
         VERBATIM)
 
-# docs
-if(BUILD_DOCS)
-    add_subdirectory(third-party/doxyconfig docs)
-endif()
-
 # tests
 if(BUILD_TESTS)
     add_subdirectory(tests)
