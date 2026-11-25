@@ -22,6 +22,12 @@
 #include <boost/property_tree/xml_parser.hpp>
 #include <Simple-Web-Server/server_http.hpp>
 
+#if defined(AURORA_SUNSHINE_HOST) && defined(_WIN32)
+  #include <windows.h>
+#elif defined(AURORA_SUNSHINE_HOST) && defined(__APPLE__)
+  #include <CoreServices/CoreServices.h>
+#endif
+
 // local includes
 #include "config.h"
 #include "display_device.h"
@@ -1239,6 +1245,9 @@ namespace nvhttp {
                         encoder.status == encoder_probe_status::ready ? "ready" : "failed";
     tree.put("root.AuroraEncoderStatus", status);
 #endif
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+    tree.put("root.AuroraPower", 1);
+#endif
     tree.put("root.MaxLumaPixelsHEVC", encoder.hevc_mode > 1 ? "1869449984" : "0");
 
     // Only include the MAC address for requests sent from paired clients over HTTPS.
@@ -1602,6 +1611,135 @@ namespace nvhttp {
     response->close_connection_after_response = true;
   }
 
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+  enum class aurora_power_action { restart, shutdown };
+  using power_status = SimpleWeb::StatusCode;
+
+  void aurora_power_response(const resp_https_t &response, power_status status, std::string_view message, SimpleWeb::CaseInsensitiveMultimap headers = {}) {
+    headers.emplace("Content-Type", "text/plain; charset=utf-8");
+    headers.emplace("Cache-Control", "no-store");
+    headers.emplace("Connection", "close");
+    response->write(status, message, headers);
+    response->close_connection_after_response = true;
+  }
+
+  struct aurora_power_result {
+    power_status status;
+    std::string_view message;
+  };
+
+#ifdef _WIN32
+  DWORD request_os_power(aurora_power_action action) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+      return GetLastError();
+    }
+    const auto close_token = util::fail_guard([&] { CloseHandle(token); });
+
+    TOKEN_PRIVILEGES requested {};
+    requested.PrivilegeCount = 1;
+    requested.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!LookupPrivilegeValueW(nullptr, L"SeShutdownPrivilege", &requested.Privileges[0].Luid)) {
+      return GetLastError();
+    }
+
+    TOKEN_PRIVILEGES previous {};
+    DWORD previous_size = 0;
+    const BOOL adjusted = AdjustTokenPrivileges(token, FALSE, &requested, sizeof(previous), &previous, &previous_size);
+    const DWORD adjust_error = GetLastError();
+    if (!adjusted || adjust_error != ERROR_SUCCESS) {
+      return adjust_error;
+    }
+    const auto restore_privilege = util::fail_guard([&] {
+      if (previous.PrivilegeCount && !AdjustTokenPrivileges(token, FALSE, &previous, 0, nullptr, nullptr)) {
+        BOOST_LOG(error) << "Aurora could not restore the Windows shutdown privilege: " << GetLastError();
+      }
+    });
+
+    constexpr DWORD grace_seconds = 5;
+    const BOOL accepted = InitiateSystemShutdownExW(nullptr, nullptr, grace_seconds, FALSE,
+      action == aurora_power_action::restart, SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_FLAG_PLANNED);
+    return accepted ? ERROR_SUCCESS : GetLastError();
+  }
+
+  aurora_power_result describe_os_power_error(DWORD error) {
+    if (error == ERROR_ACCESS_DENIED || error == ERROR_NOT_ALL_ASSIGNED || error == ERROR_PRIVILEGE_NOT_HELD) {
+      return {power_status::client_error_forbidden, "Windows shutdown permission denied"};
+    }
+    if (error == ERROR_SHUTDOWN_IN_PROGRESS) {
+      return {power_status::client_error_conflict, "Windows shutdown already in progress"};
+    }
+    return {power_status::server_error_internal_server_error, "Windows rejected the power request"};
+  }
+#elif defined(__APPLE__)
+  OSStatus request_os_power(aurora_power_action action) {
+    static constexpr auto loginwindow_bundle_id = "com.apple.loginwindow"sv;
+    AEAddressDesc target {typeNull, nullptr};
+    AppleEvent event {typeNull, nullptr};
+    AppleEvent reply {typeNull, nullptr};
+    const auto dispose = util::fail_guard([&] {
+      AEDisposeDesc(&reply);
+      AEDisposeDesc(&event);
+      AEDisposeDesc(&target);
+    });
+
+    auto result = AECreateDesc(typeApplicationBundleID, loginwindow_bundle_id.data(), loginwindow_bundle_id.size(), &target);
+    if (result != noErr) {
+      return result;
+    }
+    // These events open the system confirmation. Use the normal loginwindow flow.
+    const AEEventID event_id = action == aurora_power_action::restart ? kAEShowRestartDialog : kAEShowShutdownDialog;
+    result = AECreateAppleEvent(kCoreEventClass, event_id, &target, kAutoGenerateReturnID, kAnyTransactionID, &event);
+    if (result != noErr) {
+      return result;
+    }
+    constexpr auto timeout_ticks = 5 * 60;
+    result = AESendMessage(&event, &reply, kAEWaitReply | kAECanInteract, timeout_ticks);
+    if (result != noErr) {
+      return result;
+    }
+    SInt32 event_error = noErr;
+    result = AEGetParamPtr(&reply, keyErrorNumber, typeSInt32, nullptr, &event_error, sizeof(event_error), nullptr);
+    return result == noErr ? event_error : result == errAEDescNotFound ? noErr : result;
+  }
+
+  aurora_power_result describe_os_power_error(OSStatus error) {
+    if (error == errAEEventNotPermitted) {
+      return {power_status::client_error_forbidden, "macOS Automation permission denied"};
+    }
+    if (error == userCanceledErr) {
+      return {power_status::client_error_conflict, "macOS power request canceled"};
+    }
+    if (error == errAETimeout) {
+      return {power_status::server_error_gateway_timeout, "macOS did not confirm receipt"};
+    }
+    return {power_status::server_error_internal_server_error, "macOS rejected the power request"};
+  }
+#endif
+
+  void aurora_power(resp_https_t response, req_https_t request) {
+    const bool restart = request->query_string == "action=restart"sv;
+    const bool shutdown = request->query_string == "action=shutdown"sv;
+    if ((!restart && !shutdown) || request->content.size() != 0) {
+      BOOST_LOG(warning) << "Aurora power request rejected: invalid action or unexpected body";
+      aurora_power_response(response, power_status::client_error_bad_request, "expected action=restart or action=shutdown with an empty body");
+      return;
+    }
+
+    const auto action = restart ? aurora_power_action::restart : aurora_power_action::shutdown;
+    const auto error = request_os_power(action);
+    const auto name = restart ? "restart"sv : "shutdown"sv;
+    if (error != 0) {
+      const auto result = describe_os_power_error(error);
+      BOOST_LOG(warning) << "Aurora power request " << name << " failed: " << result.message << " (OS error " << error << ')';
+      aurora_power_response(response, result.status, result.message);
+      return;
+    }
+    BOOST_LOG(info) << "Aurora power request " << name << " accepted by the operating system";
+    aurora_power_response(response, power_status::success_accepted, "accepted");
+  }
+#endif
+
 #ifdef AURORA_SUNSHINE_HOST
   void aurora_wallpaper(resp_https_t response, req_https_t request) {
     constexpr std::streamsize max_preview_bytes = 512 * 1024;
@@ -1740,6 +1878,13 @@ namespace nvhttp {
     };
     https_server.resource["^/applist$"]["GET"] = applist;
     https_server.resource["^/appasset$"]["GET"] = appasset;
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+    https_server.resource["^/aurora-power$"]["POST"] = aurora_power;
+    https_server.resource["^/aurora-power$"]["GET"] = [](resp_https_t resp, req_https_t) {
+      BOOST_LOG(warning) << "Aurora power request rejected: POST required";
+      aurora_power_response(resp, power_status::client_error_method_not_allowed, "POST required", {{"Allow", "POST"}});
+    };
+#endif
 #ifdef AURORA_SUNSHINE_HOST
     https_server.resource["^/aurora-wallpaper$"]["GET"] = aurora_wallpaper;
 #endif
