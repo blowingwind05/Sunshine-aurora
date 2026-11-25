@@ -710,7 +710,7 @@ namespace rtsp_stream {
       auto lg = _session_slots.lock();
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
       if (std::ranges::any_of(*_session_slots, [](const auto &slot) {
-            return stream::session::aurora_privacy_owned(*slot);
+            return stream::session::aurora_privacy_owned(*slot) || stream::session::aurora_displays_owned(*slot);
           })) return false;
 #endif
       _session_slots->emplace(session);
@@ -750,21 +750,32 @@ namespace rtsp_stream {
     std::string_view session_privacy(std::string_view cert, aurora_privacy_action action) {
       auto lg = _session_slots.lock();
       using namespace stream::session;
-      if (cert.empty() || !display_device::aurora_wgc_capture_selected() ||
-          !display_device::aurora_screensaver_supported() || config::aurora_display_exclusive ||
+      if (cert.empty() || config::aurora_display_exclusive ||
           config::aurora_privacy_screensaver ||
           _session_slots->size() != 1) return "unavailable";
       auto &slot = **_session_slots->begin();
       if (client_cert(slot) != cert || !aurora_privacy_can_control(slot)) return "unavailable";
 
-      if (aurora_privacy_owned(slot)) {
-        if (!display_device::aurora_screensaver_active()) return "unavailable";
-        if (action != aurora_privacy_action::off) return "on";
+      const auto confirmed_mode = [&]() -> std::string_view {
+        if (aurora_displays_owned(slot)) return aurora_displays_closed(slot) ? "display-off" : "unavailable";
+        if (aurora_privacy_owned(slot)) return display_device::aurora_screensaver_active() ? "on" : "unavailable";
+        return "off";
+      };
+      if (action == aurora_privacy_action::status) return confirmed_mode();
+      if (action == aurora_privacy_action::display_off) {
+        if (!aurora_displays_close(slot)) return confirmed_mode();
+        aurora_privacy_release(slot);
+        return aurora_privacy_can_control(slot) && aurora_displays_closed(slot) ? "display-off" : "unavailable";
+      }
+      if (action == aurora_privacy_action::off) {
+        if (!aurora_displays_restore(slot)) return "unavailable";
         aurora_privacy_release(slot);
         return "off";
       }
-      if (action != aurora_privacy_action::on) return "off";
-      if (!aurora_privacy_acquire(slot)) return "unavailable";
+      if (!display_device::aurora_wgc_capture_selected() || !display_device::aurora_screensaver_supported())
+        return confirmed_mode();
+      if (!aurora_displays_restore(slot)) return "unavailable";
+      if (!aurora_privacy_acquire(slot)) return confirmed_mode();
 
       // The video/control workers can disconnect while the UI thread starts.
       // Keep ownership until the existing shutdown path joins those workers.
@@ -774,9 +785,12 @@ namespace rtsp_stream {
     void check_live_privacy() {
       auto lg = _session_slots.lock();
       for (const auto &slot : *_session_slots) {
-        if (!stream::session::aurora_privacy_owned(*slot) ||
-            stream::session::state(*slot) != stream::session::state_e::RUNNING) continue;
-        if (!display_device::aurora_screensaver_active() ||
+        const bool screensaver = stream::session::aurora_privacy_owned(*slot);
+        const bool display_off = stream::session::aurora_displays_owned(*slot);
+        if ((!screensaver && !display_off) || stream::session::state(*slot) != stream::session::state_e::RUNNING)
+          continue;
+        if ((screensaver && !display_device::aurora_screensaver_active()) ||
+            (display_off && !stream::session::aurora_displays_closed(*slot)) ||
             !nvhttp::aurora_screensaver_client_authorized(stream::session::client_cert(*slot))) {
           BOOST_LOG(warning) << "Aurora session privacy lost coverage or authorization; ending its stream";
           stream::session::stop(*slot);

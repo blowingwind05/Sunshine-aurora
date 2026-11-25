@@ -568,6 +568,7 @@ namespace stream {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
     bool encrypted_rtsp = false;
     bool owns_privacy_screen = false;  ///< Accessed under the RTSP session list lock.
+    std::string privacy_display;  ///< Virtual output held under the RTSP session list lock.
     std::atomic<bool> sent_video_frame = false;
 #endif
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
@@ -2269,6 +2270,31 @@ namespace stream {
         display_device::aurora_screensaver_release();
       }
     }
+
+    bool aurora_displays_owned(const session_t &session) {
+      return !session.privacy_display.empty();
+    }
+
+    bool aurora_displays_closed(const session_t &session) {
+      return aurora_displays_owned(session) && display_device::aurora_only_display_active(session.privacy_display);
+    }
+
+    bool aurora_displays_close(session_t &session) {
+      if (aurora_displays_owned(session)) return aurora_displays_closed(session);
+      session.privacy_display = display_device::aurora_close_local_displays();
+      if (session.privacy_display.empty()) return false;
+      // Capture re-enumerates first; the only active display is the selected virtual output.
+      mail::man->event<int>(mail::switch_display)->raise(0);
+      return true;
+    }
+
+    bool aurora_displays_restore(session_t &session) {
+      if (!aurora_displays_owned(session)) return true;
+      if (!display_device::aurora_restore_local_displays()) return false;
+      session.privacy_display.clear();
+      mail::man->event<int>(mail::switch_display)->raise(0);
+      return true;
+    }
 #endif
 
     /**
@@ -2320,6 +2346,7 @@ namespace stream {
       session.controlEnd.view();
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
       aurora_privacy_release(session);
+      if (aurora_displays_owned(session)) std::ignore = display_device::aurora_restore_local_displays();
       if (config::aurora_privacy_screensaver) display_device::aurora_screensaver_release();
 #endif
       // Reset input on session stop to avoid stuck repeated keys

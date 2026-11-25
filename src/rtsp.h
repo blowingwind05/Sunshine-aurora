@@ -16,7 +16,7 @@
 
 namespace rtsp_stream {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
-  enum class aurora_privacy_action { status, on, off };
+  enum class aurora_privacy_action { status, on, off, display_off };
   std::string_view aurora_session_privacy(std::string_view cert, aurora_privacy_action action);
 
   /** @brief Handle a bitrate request for the verified certificate's active session. */

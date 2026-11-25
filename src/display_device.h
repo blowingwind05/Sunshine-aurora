@@ -150,6 +150,9 @@ namespace display_device {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   [[nodiscard]] EnumeratedDeviceList aurora_virtual_displays();
   [[nodiscard]] bool aurora_display_ready();
+  [[nodiscard]] bool aurora_only_display_active(const std::string &device_id);
+  [[nodiscard]] std::string aurora_close_local_displays();
+  [[nodiscard]] bool aurora_restore_local_displays();
   [[nodiscard]] bool aurora_screensaver_supported();
   [[nodiscard]] bool aurora_wgc_capture_selected();
   void aurora_try_wgc_for_auto_capture(bool enabled);

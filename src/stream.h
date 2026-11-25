@@ -108,6 +108,10 @@ namespace stream {
     bool aurora_privacy_owned(const session_t &session);
     bool aurora_privacy_acquire(session_t &session);
     void aurora_privacy_release(session_t &session);
+    bool aurora_displays_owned(const session_t &session);
+    bool aurora_displays_closed(const session_t &session);
+    bool aurora_displays_close(session_t &session);
+    bool aurora_displays_restore(session_t &session);
 #endif
   }  // namespace session
 }  // namespace stream

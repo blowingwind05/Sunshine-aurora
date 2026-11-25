@@ -1899,9 +1899,10 @@ namespace nvhttp {
     const auto &query = request->query_string;
     const auto action = query == "action=status"sv ? std::optional {action_t::status} :
                         query == "action=on"sv ? std::optional {action_t::on} :
+                        query == "action=display-off"sv ? std::optional {action_t::display_off} :
                         query == "action=off"sv ? std::optional {action_t::off} : std::nullopt;
     if (!action || request->content.size() != 0) {
-      aurora_text_response(response, SimpleWeb::StatusCode::client_error_bad_request, "expected action=status, action=on or action=off with an empty body");
+      aurora_text_response(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid privacy action");
       return;
     }
     const auto identity = aurora_verified_peer(server, *request);

@@ -986,6 +986,48 @@ namespace display_device {
     return devices;
   }
 
+  bool aurora_only_display_active(const std::string &device_id) {
+    if (device_id.empty()) return false;
+    const WinApiLayer win;
+    const auto paths = win.queryDisplayConfig(QueryType::Active);
+    return paths && paths->m_paths.size() == 1 && win.getDeviceId(paths->m_paths.front()) == device_id;
+  }
+
+  bool aurora_restore_local_displays() {
+    std::lock_guard lock {DD_DATA.mutex};
+    if (!DD_DATA.sm_instance) return false;
+    const auto result = DD_DATA.sm_instance->execute([](auto &settings) { return settings.revertSettings(); });
+    if (result == SettingsManagerInterface::RevertResult::Ok) return true;
+    revert_configuration_unlocked(revert_option_e::try_indefinitely);
+    return false;
+  }
+
+  std::string aurora_close_local_displays() {
+    const auto virtual_displays = aurora_virtual_displays();
+    if (virtual_displays.empty()) return {};
+
+    // Prefer an inactive virtual display so restoring the layout also returns capture to a physical output.
+    const auto selected = std::ranges::min_element(virtual_displays, [](const auto &left, const auto &right) {
+      if (left.m_info.has_value() != right.m_info.has_value()) return !left.m_info.has_value();
+      return left.m_device_id < right.m_device_id;
+    });
+    const SingleDisplayConfiguration config {
+      .m_device_id = selected->m_device_id,
+      .m_device_prep = SingleDisplayConfiguration::DevicePreparation::EnsureOnlyDisplay,
+    };
+    bool applied = false;
+    {
+      std::lock_guard lock {DD_DATA.mutex};
+      if (!DD_DATA.sm_instance) return {};
+      const auto result = DD_DATA.sm_instance->execute([&config](auto &settings) { return settings.applySettings(config); });
+      applied = result == SettingsManagerInterface::ApplyResult::Ok;
+    }
+    if (applied && aurora_only_display_active(config.m_device_id)) return config.m_device_id;
+
+    std::ignore = aurora_restore_local_displays();
+    return {};
+  }
+
   namespace {
     constexpr auto curtain_class = L"AuroraPrivacyCurtain";
 
