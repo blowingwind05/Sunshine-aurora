@@ -25,6 +25,9 @@
 #endif
 
 // lib includes
+#ifdef AURORA_SUNSHINE_HOST
+  #include <openssl/crypto.h>
+#endif
 #include <rs.h>
 #ifdef _WIN32
   #include <libvirtualhid/license.hpp>
@@ -204,6 +207,41 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
+#ifdef AURORA_SUNSHINE_HOST
+  // The platform-specific managed profile and parent checks have already passed.
+  std::string aurora_admin_password(64, '\0');
+  const auto clear_admin_password = util::fail_guard([&]() {
+    OPENSSL_cleanse(aurora_admin_password.data(), aurora_admin_password.size());
+  });
+  #ifdef _WIN32
+  const auto admin_pipe = GetStdHandle(STD_INPUT_HANDLE);
+  if (GetFileType(admin_pipe) != FILE_TYPE_PIPE) {
+    std::cerr << "Aurora requires an administration password pipe.\n";
+    return 1;
+  }
+  #endif
+  // Read only the fixed frame. On macOS the same pipe stays open to watch for parent exit.
+  std::size_t password_bytes = 0;
+  while (password_bytes < aurora_admin_password.size()) {
+    auto *next = aurora_admin_password.data() + password_bytes;
+    const auto remaining = aurora_admin_password.size() - password_bytes;
+  #ifdef _WIN32
+    DWORD received = 0;
+    if (!ReadFile(admin_pipe, next, static_cast<DWORD>(remaining), &received, nullptr)) break;
+  #else
+    const auto received = read(STDIN_FILENO, next, remaining);
+    if (received < 0 && errno == EINTR) continue;
+  #endif
+    if (received <= 0) break;
+    password_bytes += static_cast<std::size_t>(received);
+  }
+  if (password_bytes != aurora_admin_password.size() ||
+      aurora_admin_password.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+    std::cerr << "Aurora requires a 64-digit hexadecimal administration password.\n";
+    return 1;
+  }
+#endif
+
 #ifdef __APPLE__
   // Bundle assets are referenced relative to the executable
   // (e.g. ../Resources/assets), so anchor cwd to Contents/MacOS.
@@ -307,6 +345,26 @@ int main(int argc, char *argv[]) {
 
     return fn->second(argv[0], config::sunshine.cmd.argc, config::sunshine.cmd.argv);
   }
+
+#ifdef AURORA_SUNSHINE_HOST
+  // The upstream default shares the pairing state file. Keep Aurora's account separate.
+  const auto &credentials_file = config::sunshine.credentials_file;
+  const auto &state_file = config::nvhttp.file_state;
+  std::error_code credentials_error;
+  if (std::filesystem::path {credentials_file}.lexically_normal() ==
+        std::filesystem::path {state_file}.lexically_normal() ||
+      std::filesystem::equivalent(credentials_file, state_file, credentials_error)) {
+    BOOST_LOG(fatal) << "Aurora requires a separate administration credentials file"sv;
+    return 1;
+  }
+  const auto saved = http::save_user_creds(credentials_file, "aurora-local", aurora_admin_password);
+  OPENSSL_cleanse(aurora_admin_password.data(), aurora_admin_password.size());
+  aurora_admin_password.clear();
+  if (saved) {
+    BOOST_LOG(fatal) << "Could not provision Aurora's private administration account"sv;
+    return 1;
+  }
+#endif
 
 #ifdef _WIN32
   config::select_all_gamepad_drivers_if_licensed(lvh::get_license_status().license.licensed());

@@ -518,7 +518,11 @@ namespace confighttp {
     BOOST_LOG(debug) << "DESTINATION :: "sv << request->path;
 
     for (auto &[name, val] : request->header) {
+#ifdef AURORA_SUNSHINE_HOST
+      BOOST_LOG(debug) << name << " -- " << (SimpleWeb::case_insensitive_equal(name, "Authorization") ? "CREDENTIALS REDACTED" : val);
+#else
       BOOST_LOG(debug) << name << " -- " << (name == "Authorization" ? "CREDENTIALS REDACTED" : val);
+#endif
     }
 
     BOOST_LOG(debug) << " [--] "sv;
@@ -2335,12 +2339,14 @@ namespace confighttp {
 
     https_server_t server {config::nvhttp.cert, config::nvhttp.pkey};
 
+#ifndef AURORA_SUNSHINE_HOST
     // Helper to create page handler lambdas without repeating the signature
     auto page_handler = [](const char *file, bool require_auth = true, bool redirect_if_username = false) {
       return [file, require_auth, redirect_if_username](const resp_https_t &response, const req_https_t &request) {
         getPage(response, request, file, require_auth, redirect_if_username);
       };
     };
+#endif
 
     // Default resource handlers
     const https_handler_t bad_request_handler = [](const resp_https_t &response, const req_https_t &request) {
@@ -2357,6 +2363,7 @@ namespace confighttp {
     server.default_resource["PUT"] = bad_request_handler;
     server.default_resource["GET"] = not_found_handler;
 
+#ifndef AURORA_SUNSHINE_HOST
     // web pages
     server.resource["^/$"]["GET"] = page_handler("index.html");
     server.resource["^/apps/?$"]["GET"] = page_handler("apps.html");
@@ -2368,6 +2375,7 @@ namespace confighttp {
     server.resource["^/pin/?$"]["GET"] = page_handler("pin.html");
     server.resource["^/troubleshooting/?$"]["GET"] = page_handler("troubleshooting.html");
     server.resource["^/welcome/?$"]["GET"] = page_handler("welcome.html", false, true);
+#endif
 
     // rest api
     server.resource["^/api/browse$"]["GET"] = browseDirectory;
@@ -2388,7 +2396,11 @@ namespace confighttp {
     server.resource["^/api/covers/([0-9]+)$"]["GET"] = getCover;
     server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
     server.resource["^/api/csrf-token$"]["GET"] = getCSRFToken;
+#ifdef AURORA_SUNSHINE_HOST
+    server.resource["^/api/password$"]["POST"] = not_found_handler;
+#else
     server.resource["^/api/password$"]["POST"] = savePassword;
+#endif
     server.resource["^/api/pin$"]["DELETE"] = cancelPairing;
     server.resource["^/api/pin$"]["GET"] = getPendingPairings;
     server.resource["^/api/pin$"]["POST"] = savePin;
@@ -2400,10 +2412,12 @@ namespace confighttp {
     server.resource["^/api/virtual-input/license$"]["POST"] = updateVirtualInputLicense;
     server.resource["^/api/virtual-input/status$"]["GET"] = getVirtualInputStatus;
 
+#ifndef AURORA_SUNSHINE_HOST
     // static/dynamic resources
     server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
     server.resource["^/images/logo-sunshine-45.png$"]["GET"] = getSunshineLogoImage;
     server.resource["^/assets\\/.+$"]["GET"] = getAsset;
+#endif
 
     server.config.reuse_address = true;
 #ifdef AURORA_SUNSHINE_HOST
