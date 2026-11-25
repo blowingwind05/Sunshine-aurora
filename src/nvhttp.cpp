@@ -1587,6 +1587,36 @@ namespace nvhttp {
     response->close_connection_after_response = true;
   }
 
+#ifdef AURORA_SUNSHINE_HOST
+  void aurora_wallpaper(resp_https_t response, req_https_t request) {
+    constexpr std::streamsize max_preview_bytes = 512 * 1024;
+    using SimpleWeb::StatusCode;
+    std::ifstream image(platf::appdata() / "aurora-wallpaper.jpg", std::ios::binary | std::ios::ate);
+    const auto size = image.tellg();
+    if (size <= 0 || size > max_preview_bytes) {
+      response->write(StatusCode::client_error_not_found);
+      return;
+    }
+    std::string jpeg(static_cast<std::size_t>(size), '\0');
+    image.seekg(0);
+    if (!image.read(jpeg.data(), size)) {
+      response->write(StatusCode::client_error_not_found);
+      return;
+    }
+
+    const auto revision = get_arg(request->parse_query_string(), "revision", "");
+    SimpleWeb::CaseInsensitiveMultimap headers {{"Cache-Control", "private, no-store"}, {"Connection", "close"}};
+    if (revision.size() == 64 && revision == util::hex_vec(crypto::hash(jpeg), true)) {
+      response->write(StatusCode::success_no_content, headers);
+    } else {
+      headers.emplace("Content-Type", "image/jpeg");
+      response->write(StatusCode::success_ok, jpeg, headers);
+    }
+    // Simple-Web-Server omits Content-Length if this is set before write().
+    response->close_connection_after_response = true;
+  }
+#endif
+
   void setup(const std::string &pkey, const std::string &cert) {
     conf_intern.pkey = pkey;
     conf_intern.servercert = cert;
@@ -1695,6 +1725,9 @@ namespace nvhttp {
     };
     https_server.resource["^/applist$"]["GET"] = applist;
     https_server.resource["^/appasset$"]["GET"] = appasset;
+#ifdef AURORA_SUNSHINE_HOST
+    https_server.resource["^/aurora-wallpaper$"]["GET"] = aurora_wallpaper;
+#endif
     https_server.resource["^/launch$"]["GET"] = [&host_audio](auto resp, auto req) {
       launch(host_audio, resp, req);
     };
