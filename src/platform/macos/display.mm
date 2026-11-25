@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <optional>
@@ -18,6 +19,9 @@
 #include "src/platform/macos/av_video.h"
 #include "src/platform/macos/misc.h"
 #include "src/platform/macos/nv12_zero_device.h"
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+  #include "src/platform/macos/aurora_privacy.h"
+#endif
 
 // Avoid conflict between AVFoundation and libavutil both defining AVMediaType
 /**
@@ -214,11 +218,103 @@ namespace platf {
     }
   };
 
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+  struct privacy_display_t: public display_t {
+    aurora_privacy::session_ptr privacy;
+    std::unique_ptr<display_device::DisplayPowerGuardInterface> display_power_guard;
+
+    int use_sample(CMSampleBufferRef sample, img_t &out) const {
+      auto image = sample ? CMSampleBufferGetImageBuffer(sample) : nullptr;
+      if (!image || CVPixelBufferGetWidth(image) != static_cast<size_t>(width) ||
+          CVPixelBufferGetHeight(image) != static_cast<size_t>(height) ||
+          CVPixelBufferGetPixelFormatType(image) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+        return -1;
+      }
+      auto &av_image = static_cast<av_img_t &>(out);
+      auto pixel_buffer = std::make_shared<av_pixel_buf_t>(sample);
+      av_image.pixel_buffer.reset();
+      av_image.sample_buffer = std::make_shared<av_sample_buf_t>(sample);
+      av_image.pixel_buffer = std::move(pixel_buffer);
+      out.width = width;
+      out.height = height;
+      out.row_pitch = static_cast<int>(CVPixelBufferGetBytesPerRowOfPlane(image, 0));
+      out.pixel_pitch = 1;
+      out.data = static_cast<uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(image, 0));
+      return 0;
+    }
+
+    capture_e capture(const push_captured_image_cb_t &push_image, const pull_free_image_cb_t &pull_image, bool *) override {
+      while (aurora_privacy::healthy(privacy)) {
+        auto sample = aurora_privacy::copy_frame(privacy, 50ms);
+        auto release_sample = util::fail_guard([sample]() {
+          if (sample) CFRelease(sample);
+        });
+        if (!aurora_privacy::healthy(privacy)) {
+          break;
+        }
+        std::shared_ptr<img_t> image;
+        if (!pull_image(image)) {
+          return capture_e::ok;
+        }
+        if (!aurora_privacy::healthy(privacy) || (sample && use_sample(sample, *image) != 0)) {
+          break;
+        }
+        if (!push_image(std::move(image), sample != nullptr)) {
+          return capture_e::ok;
+        }
+      }
+      return capture_e::error;
+    }
+
+    std::shared_ptr<img_t> alloc_img() override {
+      return std::make_shared<av_img_t>();
+    }
+
+    int dummy_img(img_t *image) override {
+      auto sample = aurora_privacy::copy_first_frame(privacy);
+      if (!sample) return -1;
+      auto release_sample = util::fail_guard([sample]() { CFRelease(sample); });
+      return use_sample(sample, *image);
+    }
+
+    std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e format) override {
+      if (format != pix_fmt_e::nv12) return nullptr;
+      auto device = std::make_unique<nv12_zero_device>();
+      // The capture stream is already running at the negotiated dimensions and format.
+      device->init(this, format, [](void *, int, int) {}, [](void *, int) {});
+      return device;
+    }
+  };
+#endif
+
   std::shared_ptr<display_t> display(platf::mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
     if (hwdevice_type != platf::mem_type_e::system && hwdevice_type != platf::mem_type_e::videotoolbox) {
       BOOST_LOG(error) << "Could not initialize display with the given hw device type."sv;
       return nullptr;
     }
+
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+    if (auto privacy = aurora_privacy::current()) {
+      if (hwdevice_type != mem_type_e::videotoolbox || !aurora_privacy::healthy(privacy)) {
+        return nullptr;
+      }
+      const auto display_id = aurora_privacy::display_id(privacy);
+      if (!display_name.empty() && display_name != std::to_string(display_id)) {
+        return nullptr;
+      }
+      auto display = std::make_shared<privacy_display_t>();
+      display->privacy = std::move(privacy);
+      display->display_power_guard = display_device::keep_display_awake("Aurora protected capture");
+      display->width = config.width;
+      display->height = config.height;
+      const auto bounds = CGDisplayBounds(display_id);
+      display->env_width = display->logical_width = static_cast<int>(bounds.size.width);
+      display->env_height = display->logical_height = static_cast<int>(bounds.size.height);
+      display->env_logical_width = display->logical_width;
+      display->env_logical_height = display->logical_height;
+      return display;
+    }
+#endif
 
     auto display = std::make_shared<av_display_t>();
 
@@ -296,6 +392,42 @@ namespace platf {
 
     return display_names;
   }
+
+#ifdef AURORA_SUNSHINE_HOST
+  std::optional<std::pair<std::size_t, std::size_t>> aurora_capture_size() {
+    // Match video::refresh_displays when starting a new capture. An explicitly
+    // configured output may be woken later, so omit geometry while it is unknown.
+    const auto outputs = display_names(mem_type_e::videotoolbox);
+    if (outputs.empty()) {
+      return std::nullopt;
+    }
+
+    const auto configured = display_device::map_output_name(config::video.output_name);
+    const auto selected = config::video.output_name.empty() ?
+      outputs.begin() : std::find(outputs.begin(), outputs.end(), configured);
+    if (selected == outputs.end()) {
+      return std::nullopt;
+    }
+
+    const auto id = parse_display_id(*selected);
+    if (!id || !CGDisplayIsActive(*id)) {
+      return std::nullopt;
+    }
+
+    const auto mode = CGDisplayCopyDisplayMode(*id);
+    if (!mode) {
+      return std::nullopt;
+    }
+
+    const auto width = CGDisplayModeGetPixelWidth(mode);
+    const auto height = CGDisplayModeGetPixelHeight(mode);
+    CFRelease(mode);
+    if (!width || !height) {
+      return std::nullopt;
+    }
+    return std::pair {width, height};
+  }
+#endif
 
   /**
    * @brief Report whether encoder backends should be probed again before streaming.

@@ -682,6 +682,9 @@ namespace video {
    */
   using hdr_info_t = std::unique_ptr<hdr_info_raw_t>;
 
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+  bool aurora_privacy_uses_videotoolbox();
+#endif
   extern int active_hevc_mode;
 
   enum class encoder_probe_status { probing, ready, failed };

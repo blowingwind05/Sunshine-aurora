@@ -1438,24 +1438,42 @@ namespace confighttp {
     send_response(response, output_tree);
   }
 
-#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
   void getAuroraPrivacy(const resp_https_t &response, const req_https_t &request) {
     if (!authenticate(response, request)) return;
 
     auto vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
+    nlohmann::json privacy = {
+      {"status", true},
+      {"saved_screensaver", vars[config::aurora_privacy_screensaver_key] == "enabled"},
+      {"active_screensaver", config::aurora_privacy_screensaver},
+    };
+  #ifdef _WIN32
     auto displays = nlohmann::json::array();
     for (const auto &device : display_device::aurora_virtual_displays()) {
       displays.push_back({{"id", device.m_device_id}, {"name", device.m_friendly_name}});
     }
     const auto &exclusive_display = vars["aurora_privacy_display_id"];
     const auto &extended_display = vars["aurora_virtual_display_id"];
-    send_response(response, {{"status", true}, {"saved", exclusive_display.empty() ? extended_display : exclusive_display},
-      {"saved_exclusive", !exclusive_display.empty()}, {"active", config::aurora_display_id},
+    privacy.update({
+      {"saved", exclusive_display.empty() ? extended_display : exclusive_display},
+      {"saved_exclusive", !exclusive_display.empty()},
+      {"active", config::aurora_display_id},
       {"active_exclusive", config::aurora_display_exclusive},
-      {"supports_virtual_display", true}, {"supports_screensaver", display_device::aurora_screensaver_supported()},
-      {"saved_screensaver", vars["aurora_privacy_screensaver"] == "enabled"},
-      {"active_screensaver", config::aurora_privacy_screensaver},
-      {"screensaver_visible", display_device::aurora_screensaver_active()}, {"displays", std::move(displays)}});
+      {"supports_virtual_display", true},
+      {"supports_screensaver", display_device::aurora_screensaver_supported()},
+      {"screensaver_visible", display_device::aurora_screensaver_active()},
+      {"displays", std::move(displays)},
+    });
+  #else
+    privacy["supports_virtual_display"] = false;
+    #ifdef AURORA_MACOS_PRIVACY_PREVIEW
+    privacy["supports_screensaver"] = true;
+    #else
+    privacy["supports_screensaver"] = false;
+    #endif
+  #endif
+    send_response(response, privacy);
   }
 #endif
 
@@ -2396,7 +2414,7 @@ namespace confighttp {
     server.resource["^/api/clients/update$"]["POST"] = updateClient;
     server.resource["^/api/config$"]["GET"] = getConfig;
     server.resource["^/api/config$"]["POST"] = saveConfig;
-#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
     server.resource["^/api/aurora/privacy$"]["GET"] = getAuroraPrivacy;
 #endif
     server.resource["^/api/configLocale$"]["GET"] = getLocale;

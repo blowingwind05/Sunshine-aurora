@@ -397,6 +397,9 @@ namespace config {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   extern std::string aurora_display_id;
   extern bool aurora_display_exclusive;
+#endif
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+  inline constexpr auto aurora_privacy_screensaver_key = "aurora_privacy_screensaver";
   extern bool aurora_privacy_screensaver;
 #endif
   extern audio_t audio;

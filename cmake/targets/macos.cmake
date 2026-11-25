@@ -1,4 +1,23 @@
 # macos specific target definitions
+option(AURORA_SUNSHINE_HOST "Build the macOS host companion managed by Aurora" OFF)
+if(AURORA_SUNSHINE_HOST)
+    target_compile_definitions(sunshine PRIVATE AURORA_SUNSHINE_HOST=1)
+endif()
+
+option(AURORA_MACOS_PRIVACY_PREVIEW "Enable Aurora's experimental macOS privacy curtain" OFF)
+if(AURORA_MACOS_PRIVACY_PREVIEW)
+    if(NOT AURORA_SUNSHINE_HOST)
+        message(FATAL_ERROR "The Aurora macOS privacy curtain requires AURORA_SUNSHINE_HOST")
+    endif()
+    find_library(SCREEN_CAPTURE_KIT_LIBRARY ScreenCaptureKit REQUIRED)
+    set(aurora_privacy_sources
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/aurora_privacy.mm"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_capture.mm")
+    target_sources(sunshine PRIVATE ${aurora_privacy_sources})
+    set_source_files_properties(${aurora_privacy_sources} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_compile_definitions(sunshine PRIVATE AURORA_MACOS_PRIVACY_PREVIEW=1)
+    target_link_libraries(sunshine ${SCREEN_CAPTURE_KIT_LIBRARY})
+endif()
 
 if (SUNSHINE_BUILD_HOMEBREW)
     target_link_options(sunshine PRIVATE LINKER:-sectcreate,__TEXT,__info_plist,${APPLE_PLIST_FILE})

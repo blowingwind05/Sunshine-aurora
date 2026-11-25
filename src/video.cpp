@@ -1485,6 +1485,11 @@ namespace video {
   };
 
   static encoder_t *chosen_encoder;
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+  bool aurora_privacy_uses_videotoolbox() {
+    return chosen_encoder == &videotoolbox;
+  }
+#endif
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   static int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   static bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.

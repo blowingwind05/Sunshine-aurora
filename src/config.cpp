@@ -717,7 +717,9 @@ namespace config {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   std::string aurora_display_id;
   bool aurora_display_exclusive;
-  bool aurora_privacy_screensaver;
+#endif
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+  bool aurora_privacy_screensaver = false;
 #endif
 
   video_t video {
@@ -1719,14 +1721,17 @@ namespace config {
       }
     }
     bool_f(vars, "dd_config_revert_on_disconnect", video.dd.config_revert_on_disconnect);
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+    std::string privacy_screensaver;
+    string_f(vars, aurora_privacy_screensaver_key, privacy_screensaver);
+    aurora_privacy_screensaver = privacy_screensaver == "enabled";
+#endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
     std::string exclusive_display;
     string_f(vars, "aurora_privacy_display_id", exclusive_display);
     string_f(vars, "aurora_virtual_display_id", aurora_display_id);
     aurora_display_exclusive = !exclusive_display.empty();
-    std::string screensaver;
-    string_f(vars, "aurora_privacy_screensaver", screensaver);
-    aurora_privacy_screensaver = screensaver == "enabled" && !aurora_display_exclusive;
+    aurora_privacy_screensaver = aurora_privacy_screensaver && !aurora_display_exclusive;
     if (aurora_privacy_screensaver && video.capture.empty()) {
       // WGC supports display affinity. Do not let automatic capture fall back to DXGI.
       video.capture = "wgc";

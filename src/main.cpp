@@ -34,6 +34,9 @@
 #endif
 
 // local includes
+#ifdef AURORA_SUNSHINE_HOST
+  #include "aurora_parent_lifetime.h"
+#endif
 #include "confighttp.h"
 #include "display_device.h"
 #include "entry_handler.h"
@@ -48,6 +51,9 @@
   #include "upnp.h"
 #endif
 #include "video.h"
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+  #include "src/platform/macos/aurora_privacy.h"
+#endif
 
 #ifdef __linux__
   #include "platform/common.h"
@@ -157,6 +163,12 @@ constexpr bool tray_is_enabled = false;
  * @param shutdown_event Shutdown event.
  */
 void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) {
+#ifdef AURORA_MACOS_PRIVACY_PREVIEW
+  if (config::aurora_privacy_screensaver) {
+    aurora_privacy::run_main_loop([&]() { return shutdown_event->peek(); });
+    return;
+  }
+#endif
   bool run_loop = false;
 
   // Conditions that would require the main thread event loop
@@ -188,18 +200,14 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
  */
 int main(int argc, char *argv[]) {
 #ifdef AURORA_SUNSHINE_HOST
-  wchar_t stop_name[128];
-  const auto stop_name_length = GetEnvironmentVariableW(L"AURORA_SUNSHINE_STOP_EVENT", stop_name, _countof(stop_name));
-  if (platf::aurora_profile().empty() || stop_name_length == 0 || stop_name_length >= _countof(stop_name)) {
+  if (argc == 2 && std::strcmp(argv[1], "--aurora-runtime-info") == 0) {
+    std::cout << "aurora-host/1" << std::endl;
+    return 0;
+  }
+  aurora::parent_lifetime parent;
+  if (!parent) {
     return 1;
   }
-  const auto aurora_stop = OpenEventW(SYNCHRONIZE, FALSE, stop_name);
-  if (!aurora_stop) {
-    return 1;
-  }
-  const auto close_aurora_stop = util::fail_guard([&]() { CloseHandle(aurora_stop); });
-  SetEnvironmentVariableW(L"AURORA_SUNSHINE_PROFILE", nullptr);
-  SetEnvironmentVariableW(L"AURORA_SUNSHINE_STOP_EVENT", nullptr);
 #endif
 #ifdef __linux__
   const bool privileged_execution = getauxval(AT_SECURE) != 0 || platf::has_elevated_privileges(true);
@@ -311,6 +319,10 @@ int main(int argc, char *argv[]) {
   if (config::parse(argc, argv)) {
     return 0;
   }
+#ifdef AURORA_SUNSHINE_HOST
+  config::sunshine.flags.reset(config::flag::UPNP);
+#endif
+
 #ifdef AURORA_SUNSHINE_HOST
   config::sunshine.flags.reset(config::flag::UPNP);
 #endif
@@ -611,8 +623,7 @@ int main(int argc, char *argv[]) {
 #ifdef AURORA_SUNSHINE_HOST
   std::jthread aurora_shutdown {[&](std::stop_token stop) {
     while (!stop.stop_requested() && !shutdown_event->peek()) {
-      const auto result = WaitForSingleObject(aurora_stop, 200);
-      if (result != WAIT_TIMEOUT) {
+      if (parent.wait_for_stop()) {
         if (!shutdown_event->peek()) {
           lifetime::exit_sunshine(0, true);
         }
