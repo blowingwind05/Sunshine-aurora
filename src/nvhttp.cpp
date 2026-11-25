@@ -30,6 +30,9 @@
 
 // local includes
 #include "config.h"
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+  #include "aurora_capture_geometry.h"
+#endif
 #include "display_device.h"
 #include "file_handler.h"
 #include "globals.h"
@@ -1282,6 +1285,17 @@ namespace nvhttp {
 
     auto current_appid = proc::proc.running();
     tree.put("root.PairStatus", pair_status);
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+    if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      // An active stream can select another capture display.
+      if (pair_status && rtsp_stream::session_count() == 0) {
+        if (const auto size = platf::aurora_capture_size()) {
+          tree.put("root.AuroraDisplayWidth", size->first);
+          tree.put("root.AuroraDisplayHeight", size->second);
+        }
+      }
+    }
+#endif
     tree.put("root.currentgame", current_appid);
     tree.put("root.state", current_appid > 0 ? "SUNSHINE_SERVER_BUSY" : "SUNSHINE_SERVER_FREE");
 
