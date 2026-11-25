@@ -1479,18 +1479,28 @@ namespace confighttp {
 
 #ifdef AURORA_SUNSHINE_HOST
   /**
+   * @brief Restrict grant management to the authenticated, local Aurora supervisor.
+   * @param response The HTTP response to use on rejection.
+   * @param request The management request to authenticate.
+   * @return True for an authenticated local request.
+   */
+  static bool authenticateAuroraClientGrant(const resp_https_t &response, const req_https_t &request) {
+    if (!net::normalize_address(request->remote_endpoint().address()).is_loopback()) {
+      response->write(SimpleWeb::StatusCode::client_error_forbidden);
+      return false;
+    }
+    return authenticate(response, request) &&
+      validate_csrf_token(response, request, get_client_id(request)) &&
+      check_content_type(response, request, "application/json");
+  }
+
+  /**
    * @brief Accept a client proof from the authenticated local Aurora supervisor.
    * @param response The HTTP response to hold the grant result.
    * @param request The loopback request and its bounded JSON fields.
    */
   void grantAuroraClient(const resp_https_t &response, const req_https_t &request) {
-    if (!net::normalize_address(request->remote_endpoint().address()).is_loopback()) {
-      response->write(SimpleWeb::StatusCode::client_error_forbidden);
-      return;
-    }
-    if (!authenticate(response, request) ||
-        !validate_csrf_token(response, request, get_client_id(request)) ||
-        !check_content_type(response, request, "application/json")) {
+    if (!authenticateAuroraClientGrant(response, request)) {
       return;
     }
 
@@ -1525,6 +1535,19 @@ namespace confighttp {
     } catch (const nlohmann::json::exception &) {
       bad_request(response, request, "Malformed client proof");
     }
+  }
+
+  /**
+   * @brief End the live grants without changing saved client approvals or legacy pairings.
+   * @param response The HTTP response confirming the grants expired.
+   * @param request The authenticated local supervisor request.
+   */
+  void expireAuroraClientGrants(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticateAuroraClientGrant(response, request)) {
+      return;
+    }
+    nvhttp::expire_tailnet_client_grants();
+    send_response(response, {{"status", true}});
   }
 #endif
 
@@ -2470,6 +2493,7 @@ namespace confighttp {
     server.resource["^/api/config$"]["POST"] = saveConfig;
 #ifdef AURORA_SUNSHINE_HOST
     server.resource["^/api/aurora/client-grant$"]["POST"] = grantAuroraClient;
+    server.resource["^/api/aurora/client-grant/expire$"]["POST"] = expireAuroraClientGrants;
 #endif
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
     server.resource["^/api/aurora/privacy$"]["GET"] = getAuroraPrivacy;

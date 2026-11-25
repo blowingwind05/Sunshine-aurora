@@ -384,6 +384,9 @@ namespace nvhttp {
    */
   tailnet_grant_result grant_tailnet_client(std::string_view name,
     std::string_view challenge_hex, std::string_view certificate_hex, std::string_view signature_hex);
+
+  /** @brief Expire live grants after the local Tailscale authority changes. */
+  void expire_tailnet_client_grants();
 #endif
 
 #ifdef SUNSHINE_TESTS

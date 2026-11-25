@@ -646,6 +646,15 @@ namespace nvhttp {
     rebuild_client_cert_chain();
     return result::accepted;
   }
+
+  void expire_tailnet_client_grants() {
+    std::lock_guard lock {client_auth_mutex()};
+    for (auto &client : client_root.named_devices) {
+      if (!client.tailnet_scope.empty()) {
+        client.tailnet_until = {};
+      }
+    }
+  }
 #endif
 
   /**

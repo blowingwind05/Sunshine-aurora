@@ -203,6 +203,13 @@ TEST_F(ClientAuthorizationTest, TailnetGrantBindsOneScopeAndRequiresRenewalAfter
   ASSERT_EQ(grant_fixture(client, host, 1, 5), accepted);
   ASSERT_TRUE(nvhttp::test_support::authorize_client_certificate(client.x509));
   ASSERT_EQ(nvhttp::get_all_clients().size(), 1);
+
+  ASSERT_FALSE(nvhttp::test_support::add_client("manual", other_client.x509, true).empty());
+  nvhttp::expire_tailnet_client_grants();
+  EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(client.x509));
+  EXPECT_TRUE(nvhttp::test_support::authorize_client_certificate(other_client.x509));
+  EXPECT_EQ(grant_fixture(client, host, 1, 6), accepted);
+  EXPECT_TRUE(nvhttp::test_support::authorize_client_certificate(client.x509));
 }
 
 TEST_F(ClientAuthorizationTest, TailnetGrantCannotResurrectDisabledOrUnpairedDevice) {
