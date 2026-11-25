@@ -667,6 +667,16 @@ namespace NVENC_NAMESPACE {
       return false;
     }
 
+#ifdef _WIN32
+    if (nvenc->nvEncReconfigureEncoder && enc_config.rcParams.rateControlMode == NV_ENC_PARAMS_RC_CBR &&
+        client_config.bitrate > 0 && get_encoder_cap(init_params.encodeGUID, NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE)) {
+      bitrate_init_ = init_params;
+      bitrate_init_.encodeConfig = nullptr;
+      bitrate_config_ = enc_config;
+      bitrate_kbps_ = client_config.bitrate;
+    }
+#endif
+
     auto frame_size_format = stat_trackers::two_digits_after_decimal();
     BOOST_LOG(debug) << "NvEnc: requested encoded frame size "
                      << frame_size_format % (client_config.bitrate / 8. / client_config.framerate) << " kB";
@@ -677,7 +687,46 @@ namespace NVENC_NAMESPACE {
     return true;
   }
 
+#ifdef _WIN32
+  int nvenc_base::live_bitrate_kbps() const {
+    return bitrate_kbps_;
+  }
+
+  int nvenc_base::reconfigure_bitrate(int kbps) {
+    if (!encoder || !bitrate_kbps_ || kbps <= 0 || kbps > 150000) {
+      return 0;
+    }
+
+    auto config = bitrate_config_;
+    auto &rate = config.rcParams;
+    rate.averageBitRate = static_cast<std::uint32_t>(kbps) * 1000;
+    const auto &initial_rate = bitrate_config_.rcParams;
+    if (initial_rate.vbvBufferSize) {
+      const auto scaled = static_cast<std::uint64_t>(initial_rate.vbvBufferSize) *
+                          rate.averageBitRate / initial_rate.averageBitRate;
+      if (scaled == 0 || scaled > UINT32_MAX) {
+        return 0;
+      }
+      rate.vbvBufferSize = static_cast<std::uint32_t>(scaled);
+      rate.vbvInitialDelay = std::min(rate.vbvInitialDelay, rate.vbvBufferSize);
+    }
+
+    NV_ENC_RECONFIGURE_PARAMS reconfigure = {.version = NV_ENC_RECONFIGURE_PARAMS_VER};
+    reconfigure.reInitEncodeParams = bitrate_init_;
+    reconfigure.reInitEncodeParams.encodeConfig = &config;
+    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &reconfigure))) {
+      BOOST_LOG(warning) << "NvEnc: NvEncReconfigureEncoder() failed: " << last_nvenc_error_string;
+      return 0;
+    }
+    bitrate_kbps_ = static_cast<int>(rate.averageBitRate / 1000);
+    return bitrate_kbps_;
+  }
+#endif
+
   void nvenc_base::destroy_encoder() {
+#ifdef _WIN32
+    bitrate_kbps_ = 0;
+#endif
     if (output_bitstream) {
       if (nvenc_failed(nvenc->nvEncDestroyBitstreamBuffer(encoder, output_bitstream))) {
         BOOST_LOG(error) << "NvEnc: NvEncDestroyBitstreamBuffer() failed: " << last_nvenc_error_string;

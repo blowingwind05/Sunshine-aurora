@@ -22,6 +22,7 @@ extern "C" {
 #include <boost/bind.hpp>
 
 // local includes
+#include "aurora_video_bitrate.h"
 #include "config.h"
 #include "display_device.h"
 #include "globals.h"
@@ -718,6 +719,34 @@ namespace rtsp_stream {
     }
 
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    /** @brief Submit control only to the sole live session owned by the paired TLS peer. */
+    std::string session_bitrate(std::string_view cert, const aurora::video_bitrate::request_t &request) {
+      std::shared_ptr<stream::session_t> owner;
+      aurora::video_bitrate::control_t *bitrate;
+      {
+        auto lg = _session_slots.lock();
+        if (cert.empty() || _session_slots->size() != 1) {
+          return "unavailable";
+        }
+        owner = *_session_slots->begin();
+        if (stream::session::client_cert(*owner) != cert) {
+          return "unavailable";
+        }
+        bitrate = stream::session::live_bitrate(*owner);
+        if (!bitrate) {
+          return "unavailable";
+        }
+        if (request.token.empty()) {
+          return bitrate->status();
+        }
+        if (const auto result = bitrate->submit(request); !result.empty()) {
+          return std::string {result};
+        }
+      }
+      // The owner keeps the controller alive while the registry is unlocked.
+      return bitrate->await();
+    }
+
     std::string_view session_privacy(std::string_view cert, aurora_privacy_action action) {
       auto lg = _session_slots.lock();
       using namespace stream::session;
@@ -812,6 +841,10 @@ namespace rtsp_stream {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   std::string_view aurora_session_privacy(std::string_view cert, aurora_privacy_action action) {
     return server.session_privacy(cert, action);
+  }
+
+  std::string aurora_session_bitrate(std::string_view cert, const aurora::video_bitrate::request_t &request) {
+    return server.session_bitrate(cert, request);
   }
 #endif
 
@@ -1339,21 +1372,26 @@ namespace rtsp_stream {
     // down to nearly nothing.
     if (configuredBitrateKbps) {
       BOOST_LOG(debug) << "Client configured bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
-
-      // If the FEC percentage isn't too high, adjust the configured bitrate to ensure video
-      // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
-      if (config::stream.fec_percentage <= 80) {
-        configuredBitrateKbps /= 100.f / (100 - config::stream.fec_percentage);
+      const auto fecPercentage = config::stream.fec_percentage;
+      // Audio uses 256 Kbps per channel in high-quality mode and 96 Kbps otherwise.
+      const auto audioBitrateAdjustment = (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels;
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      if (configuredBitrateKbps >= aurora::video_bitrate::min_requested_kbps &&
+          configuredBitrateKbps <= aurora::video_bitrate::max_requested_kbps &&
+          fecPercentage >= 0 && fecPercentage <= 100 &&
+          config.audio.channels >= 1 && config.audio.channels <= 8) {
+        config.live_bitrate = aurora::video_bitrate::budget_t {
+          static_cast<int>(configuredBitrateKbps),
+          fecPercentage,
+          audioBitrateAdjustment,
+          config::video.max_bitrate,
+        };
       }
+#endif
 
-      // Adjust the bitrate to account for audio traffic bandwidth usage (capped at 20% reduction).
-      // The bitrate per channel is 256 Kbps for high quality mode and 96 Kbps for normal quality.
-      auto audioBitrateAdjustment = (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels;
-      configuredBitrateKbps -= std::min((std::int64_t) audioBitrateAdjustment, configuredBitrateKbps / 5);
-
-      // Reduce it by another 500Kbps to account for A/V packet overhead and control data
-      // traffic (capped at 10% reduction).
-      configuredBitrateKbps -= std::min((std::int64_t) 500, configuredBitrateKbps / 10);
+      configuredBitrateKbps = aurora::video_bitrate::adjusted_encoder_kbps(
+        configuredBitrateKbps, fecPercentage, audioBitrateAdjustment
+      );
 
       BOOST_LOG(debug) << "Final adjusted video encoding bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
       config.monitor.bitrate = (int) configuredBitrateKbps;

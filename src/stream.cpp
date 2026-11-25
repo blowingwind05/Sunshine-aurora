@@ -14,6 +14,9 @@
 // lib includes
 #include <boost/endian/arithmetic.hpp>
 #include <openssl/err.h>
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  #include <openssl/rand.h>
+#endif
 #include <rs.h>
 
 extern "C" {
@@ -515,6 +518,9 @@ namespace stream {
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying the reference-frame range to invalidate.
 
       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      std::optional<aurora::video_bitrate::control_t> bitrate;  ///< Bound to this stream's lifetime.
+#endif
     } video;  ///< Video worker thread state for the active stream.
 
     struct {
@@ -2157,7 +2163,11 @@ namespace stream {
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
     BOOST_LOG(debug) << "Start capturing Video"sv;
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    video::capture(session->mail, session->config.monitor, session, session->video.bitrate ? &*session->video.bitrate : nullptr);
+#else
     video::capture(session->mail, session->config.monitor, session);
+#endif
   }
 
   /**
@@ -2205,6 +2215,32 @@ namespace stream {
     }
 
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    aurora::video_bitrate::control_t *live_bitrate(session_t &session) {
+      return session.video.bitrate && session.encrypted_rtsp &&
+             session.state.load(std::memory_order_acquire) == state_e::RUNNING &&
+             session.sent_video_frame.load(std::memory_order_acquire)
+               ? &*session.video.bitrate
+               : nullptr;
+    }
+
+    /** @brief Generate an opaque token that cannot repeat within this host process. */
+    std::string new_video_bitrate_token() {
+      std::array<unsigned char, 12> random;
+      if (RAND_bytes(random.data(), static_cast<int>(random.size())) != 1) {
+        return {};
+      }
+
+      static std::atomic<std::uint32_t> next {0};
+      auto sequence = next.load(std::memory_order_relaxed);
+      do {
+        if (sequence == UINT32_MAX) {
+          return {};
+        }
+      } while (!next.compare_exchange_weak(sequence, sequence + 1, std::memory_order_relaxed));
+
+      return aurora::video_bitrate::make_token(random, sequence);
+    }
+
     bool aurora_privacy_can_control(const session_t &session) {
       return session.encrypted_rtsp && session.state.load(std::memory_order_acquire) == state_e::RUNNING &&
              session.sent_video_frame.load(std::memory_order_acquire);
@@ -2239,6 +2275,11 @@ namespace stream {
         return;
       }
 
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      if (session.video.bitrate) {
+        session.video.bitrate->close();
+      }
+#endif
       session.shutdown_event->raise(true);
     }
 
@@ -2355,6 +2396,11 @@ namespace stream {
       session->client_cert = launch_session.client_cert;
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
       session->encrypted_rtsp = launch_session.rtsp_cipher.has_value();
+      if (session->encrypted_rtsp && !session->client_cert.empty() && config.live_bitrate) {
+        if (auto token = new_video_bitrate_token(); !token.empty()) {
+          session->video.bitrate.emplace(std::move(token), *config.live_bitrate);
+        }
+      }
 #endif
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
 

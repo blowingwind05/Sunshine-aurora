@@ -37,6 +37,9 @@ extern "C" {
 #include "platform/common.h"
 #include "sync.h"
 #include "video.h"
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  #include "aurora_video_bitrate.h"
+#endif
 
 #ifdef _WIN32
 extern "C" {
@@ -598,6 +601,18 @@ namespace video {
         force_idr = true;
       }
     }
+
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    /** @brief Return the confirmed NVENC target, or zero if live changes are unsupported. */
+    int live_bitrate_kbps() const {
+      return device && device->nvenc ? device->nvenc->live_bitrate_kbps() : 0;
+    }
+
+    /** @brief Set the live rate-control target on the encoder thread. */
+    int reconfigure_bitrate(int kbps) {
+      return device->nvenc->reconfigure_bitrate(kbps);
+    }
+#endif
 
     /**
      * @brief Submit the next frame to NVENC and return the encoded payload.
@@ -2398,6 +2413,7 @@ namespace video {
    * @param reinit_event Signal raised while the encoder/display is reinitializing.
    * @param encoder Selected encoder.
    * @param channel_data Opaque channel data passed to packets.
+   * @param bitrate Optional per-session request mailbox.
    */
   void encode_run(
     int &frame_nr,  // Store progress of the frame number
@@ -2408,8 +2424,16 @@ namespace video {
     std::unique_ptr<platf::encode_device_t> encode_device,
     safe::signal_t &reinit_event,
     const encoder_t &encoder,
-    void *channel_data
+    void *channel_data,
+    [[maybe_unused]] aurora::video_bitrate::control_t *bitrate
   ) {
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    if (bitrate) {
+      if (const auto last_target = bitrate->resume_target(); last_target > 0) {
+        config.bitrate = last_target;
+      }
+    }
+#endif
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
       return;
@@ -2452,6 +2476,18 @@ namespace video {
         return;
       }
     }
+
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    auto *live_encoder = bitrate ? dynamic_cast<nvenc_encode_session_t *>(session.get()) : nullptr;
+    if (bitrate) {
+      bitrate->attach(live_encoder ? live_encoder->live_bitrate_kbps() : 0);
+    }
+    auto detach_bitrate = util::fail_guard([bitrate] {
+      if (bitrate) {
+        bitrate->detach();
+      }
+    });
+#endif
 
     while (true) {
       bool requested_idr_frame = false;
@@ -2500,6 +2536,11 @@ namespace video {
         break;
       }
 
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      if (live_encoder) {
+        bitrate->apply([live_encoder](int target) { return live_encoder->reconfigure_bitrate(target); });
+      }
+#endif
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
@@ -2873,11 +2914,13 @@ namespace video {
    * @param mail Session mail bus.
    * @param config Video configuration.
    * @param channel_data Opaque channel data passed to packets.
+   * @param bitrate Optional per-session request mailbox.
    */
   void capture_async(
     safe::mail_t mail,
     config_t &config,
-    void *channel_data
+    void *channel_data,
+    aurora::video_bitrate::control_t *bitrate
   ) {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
 
@@ -2953,7 +2996,8 @@ namespace video {
         std::move(encode_device),
         ref->reinit_event,
         *ref->encoder_p,
-        channel_data
+        channel_data,
+        bitrate
       );
     }
   }
@@ -2964,11 +3008,13 @@ namespace video {
    * @param mail Session mail bus.
    * @param config Client-requested video configuration, normalized before capture begins.
    * @param channel_data Opaque channel data passed to packets.
+   * @param bitrate Borrowed session control, if the stream permits live bitrate changes.
    */
   void capture(
     safe::mail_t mail,
     config_t config,
-    void *channel_data
+    void *channel_data,
+    aurora::video_bitrate::control_t *bitrate
   ) {
     config = resolve_dynamic_range(*chosen_encoder, config);
 
@@ -2976,8 +3022,13 @@ namespace video {
 
     idr_events->raise(true);
     if (chosen_encoder->flags & PARALLEL_ENCODING) {
-      capture_async(std::move(mail), config, channel_data);
+      capture_async(std::move(mail), config, channel_data, bitrate);
     } else {
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+      if (bitrate) {
+        bitrate->attach(0);
+      }
+#endif
       safe::signal_t join_event;
       auto ref = capture_thread_sync.ref();
       ref->encode_session_ctx_queue.raise(sync_session_ctx_t {

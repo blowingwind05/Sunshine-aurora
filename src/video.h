@@ -21,6 +21,10 @@ extern "C" {
 
 struct AVPacket;
 
+namespace aurora::video_bitrate {
+  class control_t;
+}
+
 namespace video {
 
   /**
@@ -711,11 +715,13 @@ namespace video {
    * @param mail Session mail bus.
    * @param config Client-requested video configuration, normalized before capture begins.
    * @param channel_data Opaque channel data passed to packets.
+   * @param bitrate Borrowed session control, if the stream permits live bitrate changes.
    */
   void capture(
     safe::mail_t mail,
     config_t config,
-    void *channel_data
+    void *channel_data,
+    aurora::video_bitrate::control_t *bitrate = nullptr
   );
 
   /**

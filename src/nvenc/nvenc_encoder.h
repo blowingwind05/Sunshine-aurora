@@ -62,6 +62,14 @@ namespace nvenc {
      */
     virtual nvenc_encoded_frame encode_frame(std::uint64_t frame_index, bool force_idr) = 0;
 
+#ifdef _WIN32
+    /** @brief Return the current bitrate target, or zero if live reconfigure is unavailable. */
+    virtual int live_bitrate_kbps() const = 0;
+
+    /** @brief Apply a new rate-control target, returning the confirmed kbps or zero on failure. */
+    virtual int reconfigure_bitrate(int kbps) = 0;
+#endif
+
     /**
      * @brief Invalidate reference frames in the requested range.
      *

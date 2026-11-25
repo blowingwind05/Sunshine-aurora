@@ -66,6 +66,11 @@ namespace NVENC_NAMESPACE {
      */
     ::nvenc::nvenc_encoded_frame encode_frame(uint64_t frame_index, bool force_idr) override;
 
+#ifdef _WIN32
+    int live_bitrate_kbps() const override;
+    int reconfigure_bitrate(int kbps) override;
+#endif
+
     /**
      * @brief Perform reference frame invalidation (RFI) procedure.
      * @param first_frame First frame index of the invalidation range.
@@ -327,6 +332,12 @@ namespace NVENC_NAMESPACE {
       const video::config_t &client_config,
       NV_ENC_BUFFER_FORMAT buffer_format
     ) const;
+
+#ifdef _WIN32
+    NV_ENC_INITIALIZE_PARAMS bitrate_init_ {};  ///< SDK-version-specific initialization arguments.
+    NV_ENC_CONFIG bitrate_config_ {};  ///< Initial rate-control baseline and immutable codec configuration.
+    int bitrate_kbps_ = 0;  ///< Confirmed target for capable native Windows encoders.
+#endif
 
     NV_ENC_OUTPUT_PTR output_bitstream = nullptr;
 

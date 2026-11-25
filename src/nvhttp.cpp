@@ -1911,6 +1911,21 @@ namespace nvhttp {
     }
     aurora_text_response(response, SimpleWeb::StatusCode::success_ok, rtsp_stream::aurora_session_privacy(identity->first, *action));
   }
+
+  /** @brief Handle Aurora's paired, per-session bitrate POST. */
+  void aurora_video_bitrate(https_server_t &server, resp_https_t response, req_https_t request) {
+    const auto identity = aurora_verified_peer(server, *request);
+    if (!identity) {
+      aurora_text_response(response, SimpleWeb::StatusCode::client_error_forbidden, "unavailable");
+      return;
+    }
+    const auto command = aurora::video_bitrate::parse(request->query_string, request->content.size() == 0);
+    if (!command) {
+      aurora_text_response(response, SimpleWeb::StatusCode::client_error_bad_request, "failed");
+      return;
+    }
+    aurora_text_response(response, SimpleWeb::StatusCode::success_ok, rtsp_stream::aurora_session_bitrate(identity->first, *command));
+  }
 #endif
 
   void start() {
@@ -2013,6 +2028,12 @@ namespace nvhttp {
     };
     https_server.resource["^/aurora-session-privacy$"]["GET"] = [](resp_https_t resp, req_https_t) {
       aurora_text_response(resp, SimpleWeb::StatusCode::client_error_method_not_allowed, "POST required", {{"Allow", "POST"}});
+    };
+    https_server.resource["^/aurora-video-bitrate-v2$"]["POST"] = [&https_server](resp_https_t resp, req_https_t req) {
+      aurora_video_bitrate(https_server, resp, req);
+    };
+    https_server.resource["^/aurora-video-bitrate-v2$"]["GET"] = [](resp_https_t resp, req_https_t req) {
+      aurora_text_response(resp, SimpleWeb::StatusCode::client_error_method_not_allowed, "unavailable", {{"Allow", "POST"}});
     };
 #endif
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))

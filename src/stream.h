@@ -14,6 +14,9 @@
 #include "audio.h"
 #include "crypto.h"
 #include "video.h"
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  #include "aurora_video_bitrate.h"
+#endif
 
 namespace stream {
   constexpr auto VIDEO_STREAM_PORT = 9;  ///< GameStream base-port offset used for the video UDP stream.
@@ -28,6 +31,9 @@ namespace stream {
   struct config_t {
     audio::config_t audio;  ///< Audio capture configuration for the stream.
     video::config_t monitor;  ///< Video capture and encoder configuration for the selected monitor.
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    std::optional<aurora::video_bitrate::budget_t> live_bitrate;  ///< Negotiated client and encoder budget.
+#endif
 
     int packetsize;  ///< Maximum payload size for network packets.
     int minRequiredFecPackets;  ///< Minimum recovery packets required before FEC is emitted.
@@ -95,6 +101,9 @@ namespace stream {
      */
     const std::string &client_cert(session_t &session);
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+    /** @brief Return the bitrate controller for a live, encrypted, video-producing session. */
+    aurora::video_bitrate::control_t *live_bitrate(session_t &session);
+
     bool aurora_privacy_can_control(const session_t &session);
     bool aurora_privacy_owned(const session_t &session);
     bool aurora_privacy_acquire(session_t &session);

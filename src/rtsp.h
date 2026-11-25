@@ -10,11 +10,17 @@
 // local includes
 #include "crypto.h"
 #include "thread_safe.h"
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+  #include "aurora_video_bitrate.h"
+#endif
 
 namespace rtsp_stream {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   enum class aurora_privacy_action { status, on, off };
   std::string_view aurora_session_privacy(std::string_view cert, aurora_privacy_action action);
+
+  /** @brief Handle a bitrate request for the verified certificate's active session. */
+  std::string aurora_session_bitrate(std::string_view cert, const aurora::video_bitrate::request_t &request);
 #endif
 
   constexpr auto RTSP_SETUP_PORT = 21;  ///< GameStream base-port offset used for the RTSP setup listener.
