@@ -385,6 +385,33 @@ namespace platf {
   }
 #endif
 
+  namespace {
+    /** @brief Latest sample from an AVFoundation delegate with a bounded consumer wait. */
+    struct av_samples_t {
+      std::mutex mutex;
+      std::condition_variable changed;
+      std::shared_ptr<av_sample_buf_t> latest;
+
+      void put(CMSampleBufferRef sample) {
+        if (!sample || !CMSampleBufferIsValid(sample) || !CMSampleBufferDataIsReady(sample) ||
+            !CMSampleBufferGetImageBuffer(sample)) {
+          return;
+        }
+        {
+          std::lock_guard lock {mutex};
+          latest = std::make_shared<av_sample_buf_t>(sample);
+        }
+        changed.notify_one();
+      }
+
+      std::shared_ptr<av_sample_buf_t> take() {
+        std::unique_lock lock {mutex};
+        changed.wait_for(lock, 50ms, [&] { return static_cast<bool>(latest); });
+        return std::exchange(latest, nullptr);
+      }
+    };
+  }
+
   /**
    * @brief macOS display capture source and image buffers.
    */
@@ -397,62 +424,73 @@ namespace platf {
       [av_capture release];
     }
 
-    capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
-      auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
+    /** @brief Subscribe a sink that owns its inbox and never calls the video worker or AVVideo. */
+    bool start_live_output(const std::shared_ptr<av_samples_t> &inbox) {
+      return [av_capture startBufferedCapture:^(CMSampleBufferRef sample) { inbox->put(sample); }];
+    }
+
+    capture_e capture(const push_captured_image_cb_t &push, const pull_free_image_cb_t &pull, bool *) override {
+      const auto should_reinit = [] {
 #ifdef AURORA_SUNSHINE_HOST
-        if (!sampleBuffer || !CMSampleBufferIsValid(sampleBuffer) || !CMSampleBufferDataIsReady(sampleBuffer) ||
-            !CMSampleBufferGetImageBuffer(sampleBuffer)) {
-          return true;
-        }
+        return static_cast<bool>(current_exact_target());
+#else
+        return false;
 #endif
-        auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
-        auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
+      };
+      if (should_reinit()) {
+        return capture_e::reinit;
+      }
 
-        std::shared_ptr<img_t> img_out;
-        if (!pull_free_image_cb(img_out)) {
-          // got interrupt signal
-          // returning false here stops capture backend
-          return false;
-        }
-        auto av_img = std::static_pointer_cast<av_img_t>(img_out);
-#ifdef AURORA_SUNSHINE_HOST
-        av_img->source_display_id = display_id;
-        av_img->ordinary_display_source = true;
-#endif
-
-        auto old_data_retainer = std::make_shared<temp_retain_av_img_t>(
-          av_img->sample_buffer,
-          av_img->pixel_buffer,
-          img_out->data
-        );
-
-        av_img->sample_buffer = new_sample_buffer;
-        av_img->pixel_buffer = new_pixel_buffer;
-        img_out->data = new_pixel_buffer->data();
-
-        img_out->width = (int) CVPixelBufferGetWidth(new_pixel_buffer->buf);
-        img_out->height = (int) CVPixelBufferGetHeight(new_pixel_buffer->buf);
-        img_out->row_pitch = (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
-        img_out->pixel_pitch = img_out->row_pitch / img_out->width;
-
-        old_data_retainer = nullptr;
-
-        if (!push_captured_image_cb(std::move(img_out), true)) {
-          // got interrupt signal
-          // returning false here stops capture backend
-          return false;
-        }
-
-        return true;
-      }];
-
-      if (!signal) {
+      const auto inbox = std::make_shared<av_samples_t>();
+      if (!start_live_output(inbox)) {
         return capture_e::error;
       }
-      // FIXME: We should time out if an image isn't returned for a while
-      dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
+      auto stop_output = util::fail_guard([&] { [av_capture stopBufferedCapture]; });
 
-      return capture_e::ok;
+      while (true) {
+        // A selection wakes reinit even on an idle output. Do not forward a buffered old frame.
+        if (should_reinit()) {
+          return capture_e::reinit;
+        }
+        auto sample = inbox->take();
+        if (should_reinit()) {
+          return capture_e::reinit;
+        }
+
+        if (!sample) {
+          // Both Mac encoders use the async worker. A no-image tick services its queue without
+          // waiting for an image pool slot or fabricating a sample.
+          if (!push({}, false)) {
+            return capture_e::ok;
+          }
+          continue;
+        }
+        std::shared_ptr<img_t> image;
+        if (!pull(image)) {
+          return capture_e::ok;
+        }
+
+        auto &out = static_cast<av_img_t &>(*image);
+        auto pixel = std::make_shared<av_pixel_buf_t>(sample->buf);
+        out.pixel_buffer.reset();
+        out.sample_buffer = std::move(sample);
+        out.pixel_buffer = std::move(pixel);
+        out.data = out.pixel_buffer->data();
+        out.width = static_cast<int>(CVPixelBufferGetWidth(out.pixel_buffer->buf));
+        out.height = static_cast<int>(CVPixelBufferGetHeight(out.pixel_buffer->buf));
+        out.row_pitch = static_cast<int>(CVPixelBufferGetBytesPerRow(out.pixel_buffer->buf));
+        out.pixel_pitch = out.row_pitch / out.width;
+#ifdef AURORA_SUNSHINE_HOST
+        out.source_display_id = display_id;
+        out.ordinary_display_source = true;
+#endif
+        if (should_reinit()) {
+          return capture_e::reinit;
+        }
+        if (!push(std::move(image), true)) {
+          return capture_e::ok;
+        }
+      }
     }
 
     /**
@@ -501,7 +539,7 @@ namespace platf {
         return 1;
       }
 
-      auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
+      const bool captured = [av_capture probeCapture:^(CMSampleBufferRef sampleBuffer) {
 #ifdef AURORA_SUNSHINE_HOST
         if (!sampleBuffer || !CMSampleBufferIsValid(sampleBuffer) || !CMSampleBufferDataIsReady(sampleBuffer) ||
             !CMSampleBufferGetImageBuffer(sampleBuffer)) {
@@ -538,12 +576,7 @@ namespace platf {
         return false;
       }];
 
-      if (!signal) {
-        return -1;
-      }
-      dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
-
-      return 0;
+      return captured ? 0 : -1;
     }
 
     /**
@@ -573,35 +606,10 @@ namespace platf {
 
 #ifdef AURORA_SUNSHINE_HOST
   namespace {
-    /** @brief Latest sample from an AVFoundation delegate with a bounded consumer wait. */
-    struct exact_samples_t {
-      std::mutex mutex;
-      std::condition_variable changed;
-      std::shared_ptr<av_sample_buf_t> latest;
-
-      void put(CMSampleBufferRef sample) {
-        if (!sample || !CMSampleBufferIsValid(sample) || !CMSampleBufferDataIsReady(sample) ||
-            !CMSampleBufferGetImageBuffer(sample)) {
-          return;
-        }
-        {
-          std::lock_guard lock {mutex};
-          latest = std::make_shared<av_sample_buf_t>(sample);
-        }
-        changed.notify_one();
-      }
-
-      std::shared_ptr<av_sample_buf_t> take() {
-        std::unique_lock lock {mutex};
-        changed.wait_for(lock, 50ms, [&] { return static_cast<bool>(latest); });
-        return std::exchange(latest, nullptr);
-      }
-    };
-
     /** @brief VideoToolbox capture bound to one exact Mac display selection. */
     struct exact_av_display_t: av_display_t {
       std::shared_ptr<exact_target_t> target;
-      std::shared_ptr<exact_samples_t> samples = std::make_shared<exact_samples_t>();
+      std::shared_ptr<av_samples_t> samples = std::make_shared<av_samples_t>();
       std::shared_ptr<av_sample_buf_t> first_frame;
       OSType format {};
       int output_width {}, output_height {};
@@ -659,14 +667,15 @@ namespace platf {
 
         @autoreleasepool {
           @try {
-            av_capture = [[AVVideo alloc] initWithDisplay:display_id frameRate:config.framerate excludeCursor:config.aurora_client_cursor];
+            // Exact capture uses a client-drawn cursor after the presentation barrier, even
+            // when the stream originally negotiated relative pointer mode.
+            av_capture = [[AVVideo alloc] initWithDisplay:display_id frameRate:config.framerate excludeCursor:YES];
             if (!av_capture) {
               return false;
             }
             [av_capture setFrameWidth:output_width frameHeight:output_height];
             av_capture.pixelFormat = format;
-            const auto inbox = samples;
-            if (![av_capture startBufferedCapture:^(CMSampleBufferRef sample) { inbox->put(sample); }]) {
+            if (!start_live_output(samples)) {
               return false;
             }
           } @catch (NSException *) {

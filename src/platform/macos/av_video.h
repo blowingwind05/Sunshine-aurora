@@ -9,17 +9,9 @@
 #import <CoreGraphics/CoreGraphics.h>
 
 /**
- * @brief macOS capture session and video output handles.
- */
-struct CaptureSession {
-  AVCaptureVideoDataOutput *output;  ///< Output.
-  NSCondition *captureStopped;  ///< Capture stopped.
-};
-
-/**
  * @brief AVFoundation video capture controller used by the macOS backend.
  */
-@interface AVVideo: NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
+@interface AVVideo: NSObject
 
 /**
  * @brief Display ID property.
@@ -54,18 +46,6 @@ typedef void (^FrameSinkBlock)(CMSampleBufferRef);
  * @brief Capture session that owns the active AVFoundation inputs and outputs.
  */
 @property (nonatomic, assign) AVCaptureSession *session;
-/**
- * @brief Video outputs property.
- */
-@property (nonatomic, assign) NSMapTable<AVCaptureConnection *, AVCaptureVideoDataOutput *> *videoOutputs;
-/**
- * @brief Capture callbacks property.
- */
-@property (nonatomic, assign) NSMapTable<AVCaptureConnection *, FrameCallbackBlock> *captureCallbacks;
-/**
- * @brief Capture signals property.
- */
-@property (nonatomic, assign) NSMapTable<AVCaptureConnection *, dispatch_semaphore_t> *captureSignals;
 
 /**
  * @brief Initialize AVFoundation capture for a display and frame rate.
@@ -88,14 +68,16 @@ typedef void (^FrameSinkBlock)(CMSampleBufferRef);
  */
 - (void)setFrameWidth:(int)frameWidth frameHeight:(int)frameHeight;
 /**
- * @brief Run the capture loop for this backend.
- *
- * @param frameCallback Frame callback.
- * @return Capture status reported to the streaming pipeline.
+ * @brief Probe capture until the callback accepts a sample and returns false.
+ * @param frameCallback Receives samples for the encoder probe.
+ * @return Whether the probe completed, with its delegate drained before returning.
  */
-- (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback;
+- (BOOL)probeCapture:(FrameCallbackBlock)frameCallback;
 
 /** @brief Attach a persistent sample output. The sink must not call back into AVVideo. */
 - (BOOL)startBufferedCapture:(FrameSinkBlock)sink;
+
+/** @brief Detach and drain the buffered delegate on the capture owner thread. Safe to repeat. */
+- (void)stopBufferedCapture;
 
 @end

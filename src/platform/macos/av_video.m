@@ -44,7 +44,7 @@ static BOOL excludeScreenCursor(AVCaptureScreenInput *input) {
 @end
 
 @implementation AVVideo {
-  AVCaptureVideoDataOutput *_bufferedOutput;  ///< Persistent output for exact-display capture.
+  AVCaptureVideoDataOutput *_bufferedOutput;  ///< Persistent output for live display capture.
   AVBufferedSampleSink *_bufferedSink;  ///< Retained delegate for the persistent output.
   dispatch_queue_t _bufferedQueue;  ///< Serial delegate queue, drained before releasing the sink.
 }
@@ -71,9 +71,6 @@ static BOOL excludeScreenCursor(AVCaptureScreenInput *input) {
   self.frameHeight = (int) CGDisplayModeGetPixelHeight(mode);
   self.minFrameDuration = CMTimeMake(1, frameRate);
   self.session = [[AVCaptureSession alloc] init];
-  self.videoOutputs = [[NSMapTable alloc] init];
-  self.captureCallbacks = [[NSMapTable alloc] init];
-  self.captureSignals = [[NSMapTable alloc] init];
 
   CFRelease(mode);
 
@@ -100,19 +97,8 @@ static BOOL excludeScreenCursor(AVCaptureScreenInput *input) {
 }
 
 - (void)dealloc {
-  if (_bufferedOutput) {
-    [_bufferedOutput setSampleBufferDelegate:nil queue:NULL];
-  }
+  [self stopBufferedCapture];
   [self.session stopRunning];
-  if (_bufferedQueue) {
-    dispatch_sync(_bufferedQueue, ^{});
-    dispatch_release(_bufferedQueue);
-  }
-  [_bufferedOutput release];
-  [_bufferedSink release];
-  [self.videoOutputs release];
-  [self.captureCallbacks release];
-  [self.captureSignals release];
   [self.session release];
   [super dealloc];
 }
@@ -132,78 +118,104 @@ static BOOL excludeScreenCursor(AVCaptureScreenInput *input) {
   };
 }
 
+/** @brief Attach and start one output without changing the selected display input. */
+- (BOOL)attachOutput:(AVCaptureVideoDataOutput *)output sink:(AVBufferedSampleSink *)sink queue:(dispatch_queue_t)queue {
+  [output setVideoSettings:[self outputSettings]];
+  [output setSampleBufferDelegate:sink queue:queue];
+  @synchronized(self) {
+    [self.session stopRunning];
+    const BOOL attached = [self.session canAddOutput:output];
+    if (attached) {
+      [self.session addOutput:output];
+    }
+    if (self.session.outputs.count) {
+      [self.session startRunning];
+    }
+    return attached && self.session.isRunning;
+  }
+}
+
+/** @brief Stop delivery, preserve other outputs, and drain before releasing the sink. */
+- (void)detachOutput:(AVCaptureVideoDataOutput *)output queue:(dispatch_queue_t)queue {
+  if (output) {
+    [output setSampleBufferDelegate:nil queue:NULL];
+    @synchronized(self) {
+      if ([self.session.outputs containsObject:output]) {
+        [self.session stopRunning];
+        [self.session removeOutput:output];
+        if (self.session.outputs.count) {
+          [self.session startRunning];
+        }
+      }
+    }
+  }
+  if (queue) {
+    dispatch_sync(queue, ^{});
+  }
+}
+
 - (BOOL)startBufferedCapture:(FrameSinkBlock)sink {
   if (_bufferedOutput || !sink) {
     return NO;
   }
+  BOOL running = NO;
   @try {
     _bufferedOutput = [[AVCaptureVideoDataOutput alloc] init];
     _bufferedSink = [[AVBufferedSampleSink alloc] initWithSink:sink];
-    _bufferedQueue = dispatch_queue_create("aurora.exact-display.capture", DISPATCH_QUEUE_SERIAL);
+    _bufferedQueue = dispatch_queue_create("sunshine.video.capture", DISPATCH_QUEUE_SERIAL);
     _bufferedOutput.alwaysDiscardsLateVideoFrames = YES;
-    [_bufferedOutput setVideoSettings:[self outputSettings]];
-    [_bufferedOutput setSampleBufferDelegate:_bufferedSink queue:_bufferedQueue];
-    [self.session stopRunning];
-    if (![self.session canAddOutput:_bufferedOutput]) {
-      return NO;
-    }
-    [self.session addOutput:_bufferedOutput];
-    [self.session startRunning];
-    return self.session.isRunning;
+    running = [self attachOutput:_bufferedOutput sink:_bufferedSink queue:_bufferedQueue];
   } @catch (NSException *) {
+    running = NO;
+  }
+  if (!running) {
+    [self stopBufferedCapture];
+  }
+  return running;
+}
+
+- (void)stopBufferedCapture {
+  [self detachOutput:_bufferedOutput queue:_bufferedQueue];
+  if (_bufferedQueue) {
+    dispatch_release(_bufferedQueue);
+    _bufferedQueue = NULL;
+  }
+  [_bufferedOutput release];
+  _bufferedOutput = nil;
+  [_bufferedSink release];
+  _bufferedSink = nil;
+}
+
+- (BOOL)probeCapture:(FrameCallbackBlock)frameCallback {
+  if (!frameCallback) {
     return NO;
   }
-}
-
-- (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback {
-  @synchronized(self) {
-    AVCaptureVideoDataOutput *videoOutput = [[AVCaptureVideoDataOutput alloc] init];
-    [videoOutput setVideoSettings:[self outputSettings]];
-
-    dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, DISPATCH_QUEUE_PRIORITY_HIGH);
-    dispatch_queue_t recordingQueue = dispatch_queue_create("videoCaptureQueue", qos);
-    [videoOutput setSampleBufferDelegate:self queue:recordingQueue];
-
-    [self.session stopRunning];
-
-    if ([self.session canAddOutput:videoOutput]) {
-      [self.session addOutput:videoOutput];
-    } else {
-      [videoOutput release];
-      return nil;
+  AVCaptureVideoDataOutput *output = [[AVCaptureVideoDataOutput alloc] init];
+  dispatch_semaphore_t done = dispatch_semaphore_create(0);
+  dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, DISPATCH_QUEUE_PRIORITY_HIGH);
+  dispatch_queue_t queue = dispatch_queue_create("sunshine.video.probe", qos);
+  __block BOOL completed = NO;
+  AVBufferedSampleSink *sink = [[AVBufferedSampleSink alloc] initWithSink:^(CMSampleBufferRef sample) {
+    if (!completed && !frameCallback(sample)) {
+      completed = YES;
+      dispatch_semaphore_signal(done);
     }
-
-    AVCaptureConnection *videoConnection = [videoOutput connectionWithMediaType:AVMediaTypeVideo];
-    dispatch_semaphore_t signal = dispatch_semaphore_create(0);
-
-    [self.videoOutputs setObject:videoOutput forKey:videoConnection];
-    [self.captureCallbacks setObject:frameCallback forKey:videoConnection];
-    [self.captureSignals setObject:signal forKey:videoConnection];
-
-    [self.session startRunning];
-
-    return signal;
-  }
-}
-
-- (void)captureOutput:(AVCaptureOutput *)captureOutput
-  didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
-         fromConnection:(AVCaptureConnection *)connection {
-  FrameCallbackBlock callback = [self.captureCallbacks objectForKey:connection];
-
-  if (callback != nil) {
-    if (!callback(sampleBuffer)) {
-      @synchronized(self) {
-        [self.session stopRunning];
-        [self.captureCallbacks removeObjectForKey:connection];
-        [self.session removeOutput:[self.videoOutputs objectForKey:connection]];
-        [self.videoOutputs removeObjectForKey:connection];
-        dispatch_semaphore_signal([self.captureSignals objectForKey:connection]);
-        [self.captureSignals removeObjectForKey:connection];
-        [self.session startRunning];
-      }
+  }];
+  BOOL running = NO;
+  @try {
+    running = [self attachOutput:output sink:sink queue:queue];
+    if (running) {
+      dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
     }
+  } @catch (NSException *) {
+    running = NO;
   }
+  [self detachOutput:output queue:queue];
+  [sink release];
+  [output release];
+  dispatch_release(queue);
+  dispatch_release(done);
+  return running;
 }
 
 @end
