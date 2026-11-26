@@ -2313,7 +2313,7 @@ namespace stream {
       if (!authorized()) return displays::result {displays::status::denied};
       const auto &video = session.config.monitor;
       auto reply = session.display_control.apply(request, displays::mac_backend(), authorized, session.display_switch_opt_in,
-        {static_cast<unsigned>(video.width), static_cast<unsigned>(video.height), 0});
+        {static_cast<unsigned>(video.width), static_cast<unsigned>(video.height), static_cast<unsigned>(video.framerate)});
       if (request.action != displays::operation::select || reply.state != displays::status::pending) return reply;
       const auto pending = session.display_control.capture.take_pending();
       if (pending) {

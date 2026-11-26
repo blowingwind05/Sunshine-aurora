@@ -221,7 +221,18 @@ int main() {
   require(staging.capture.report_inventory_ready(10) && stage(display_list).can_create && !stage(display_list).can_select,
     "inventory and live selection capabilities are independent");
   staging_driver.primary_refresh = 0;
-  require(stage(create_default).state == status::mode_unavailable && staging_driver.creations == 0, "unknown refresh does not silently substitute a mode");
+  require(stage(create_default).state == status::mode_unavailable && staging_driver.creations == 0, "unknown refresh without a session rate");
+  {
+    fake_backend variable_refresh;
+    variable_refresh.primary_refresh = 0;
+    controller live;
+    live.capture.enable();
+    require(live.capture.observe_source(10, true) && live.capture.report_inventory_ready(10), "confirm the variable-refresh source");
+    const auto created = live.apply(create_default, variable_refresh, authorized, true, {3024, 1964, 30});
+    require(created.state == status::ok && variable_refresh.requested_mode == display_mode {3024, 1964, 30},
+      "use the negotiated frame rate while preserving a variable-refresh screen's shape");
+    require(live.cleanup(), "clean up the fallback monitor");
+  }
   staging_driver.primary_refresh = 59.94;
   staging_driver.primary_mode.width = 3025;
   require(stage(create_default).state == status::mode_unavailable, "an unrepresentable host mode is rejected");

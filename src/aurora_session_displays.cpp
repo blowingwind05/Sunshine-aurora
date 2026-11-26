@@ -24,12 +24,15 @@ namespace aurora::session_display {
       return parsed.ec == std::errc {} && parsed.ptr == end && value != 0;
     }
 
-    /** @brief Follow the observed monitor mode, preserving exact pixel dimensions and aspect ratio. */
-    std::optional<display_mode> default_mode(const result &topology) {
+    /** @brief Keep exact pixel geometry and use the negotiated rate when Quartz has no usable rate. */
+    std::optional<display_mode> default_mode(const result &topology, unsigned stream_fps) {
       const auto active = std::ranges::find(topology.displays, topology.active, &display::id);
-      if (active == topology.displays.end() || !active->ready || active->width > 7680 || active->height > 4320 ||
-          !std::isfinite(active->refresh_rate) || active->refresh_rate < 29.5 || active->refresh_rate >= 240.5) return {};
-      const auto fps = static_cast<int>(std::lround(active->refresh_rate));
+      if (active == topology.displays.end() || !active->ready || active->width > 7680 || active->height > 4320) return {};
+      const auto rate = active->refresh_rate;
+      int fps = stream_fps <= 240 ? static_cast<int>(stream_fps) : 0;
+      if (std::isfinite(rate) && rate >= 29.5 && rate < 240.5) {
+        fps = static_cast<int>(std::lround(rate));
+      }
       if (!legal_mode(static_cast<int>(active->width), static_cast<int>(active->height), fps)) return {};
       return display_mode {active->width, active->height, static_cast<unsigned>(fps)};
     }
@@ -159,7 +162,7 @@ namespace aurora::session_display {
         if (!state.inventory_safe && !switching_available) return describe_now(status::not_ready);
         const auto topology = describe_now(status::ok);
         if (topology.state != status::ok) return topology;
-        const auto mode = request.mode.width ? std::optional {request.mode} : default_mode(topology);
+        const auto mode = request.mode.width ? std::optional {request.mode} : default_mode(topology, stream_mode.fps);
         if (!mode) return describe_now(status::mode_unavailable);
         const auto same = std::ranges::find(owned, *mode, &owned_display::mode);
         if (same != owned.end()) {
