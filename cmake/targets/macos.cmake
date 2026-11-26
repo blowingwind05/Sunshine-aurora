@@ -44,5 +44,9 @@ target_link_options(sunshine PRIVATE -Wl,-U,_CGPreflightScreenCaptureAccess -Wl,
 
 if(AURORA_SUNSHINE_HOST)
     find_library(AURORA_CORE_SERVICES CoreServices REQUIRED)
-    target_link_libraries(${sunshine_engine_target} ${AURORA_CORE_SERVICES})
+    find_library(AURORA_CORE_GRAPHICS CoreGraphics REQUIRED)
+    set(aurora_virtual_monitor_source "${CMAKE_SOURCE_DIR}/src/platform/macos/aurora_virtual_monitor.mm")
+    target_sources(${sunshine_engine_target} PRIVATE "${aurora_virtual_monitor_source}")
+    set_source_files_properties("${aurora_virtual_monitor_source}" PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(${sunshine_engine_target} ${AURORA_CORE_SERVICES} ${AURORA_CORE_GRAPHICS})
 endif()

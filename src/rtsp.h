@@ -6,6 +6,7 @@
 
 // standard includes
 #include <atomic>
+#include <functional>
 
 // local includes
 #include "aurora_client_cursor.h"
@@ -16,6 +17,15 @@
 #endif
 
 namespace rtsp_stream {
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || (defined(__APPLE__) && defined(AURORA_MACOS_PRIVACY_PREVIEW)))
+  /**
+   * @brief Run the profile operation only while the matching certificate owns the sole running session.
+   * @param cert Exact PEM for the verified TLS peer.
+   * @param operation Bounded synchronous operation. Must recheck paired authorization before touching the profile.
+   * @return Whether the session authorized entry to the operation.
+   */
+  bool aurora_with_privacy_appearance_owner(std::string_view cert, const std::function<void()> &operation);
+#endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   enum class aurora_privacy_action { status, on, off, display_off };
   std::string_view aurora_session_privacy(std::string_view cert, aurora_privacy_action action);

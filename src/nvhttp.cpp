@@ -11,11 +11,13 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <utility>
 
 // lib includes
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/context_base.hpp>
 #include <boost/property_tree/json_parser.hpp>
@@ -34,6 +36,7 @@
 #include "config.h"
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
   #include "aurora_capture_geometry.h"
+  #include "aurora_privacy_appearance.h"
 #endif
 #include "display_device.h"
 #include "file_handler.h"
@@ -2125,6 +2128,93 @@ namespace nvhttp {
   }
 #endif
 
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+  /**
+   * @brief Read or change the saved screensaver image for the sole current paired stream owner.
+   * @param server GameStream HTTPS server providing the exact TLS peer certificate.
+   * @param response HTTP response for the authorized connection.
+   * @param request GET without a query, POST action=save with an RGB PNG, or POST action=reset.
+   */
+  void aurora_privacy_appearance(https_server_t &server, resp_https_t response, req_https_t request) {
+    using SimpleWeb::StatusCode;
+    const auto identity = aurora_verified_peer(server, *request);
+    if (!identity) {
+      aurora_text_response(response, StatusCode::client_error_forbidden, "denied");
+      return;
+    }
+  #if defined(_WIN32) || defined(AURORA_MACOS_PRIVACY_PREVIEW)
+    namespace appearance = aurora::privacy_appearance;
+    const bool get = request->method == "GET"sv && request->query_string.empty();
+    const bool save = request->method == "POST"sv && request->query_string == "action=save"sv;
+    const bool reset = request->method == "POST"sv && request->query_string == "action=reset"sv;
+    const auto size = request->content.size();
+    if ((!get && !save && !reset) || (!save && size != 0)) {
+      aurora_text_response(response, StatusCode::client_error_bad_request, "invalid-request");
+      return;
+    }
+    if (size > appearance::max_png_bytes) {
+      aurora_text_response(response, StatusCode::client_error_payload_too_large, "too-large");
+      return;
+    }
+    std::string png;
+    if (save) {
+      const auto [type, end] = request->header.equal_range("Content-Type");
+      if (type == end || std::next(type) != end || !boost::iequals(type->second, "image/png") ||
+          request->header.count("Content-Encoding")) {
+        aurora_text_response(response, StatusCode::client_error_unsupported_media_type, "expected-image-png");
+        return;
+      }
+      png.resize(size);
+      if (!request->content.read(png.data(), static_cast<std::streamsize>(size))) {
+        aurora_text_response(response, StatusCode::client_error_bad_request, "invalid-request");
+        return;
+      }
+    }
+
+    std::optional<appearance::result> result;
+    auto certificate = crypto::x509(identity->first);
+    if (certificate) {
+      rtsp_stream::aurora_with_privacy_appearance_owner(identity->first, [&] {
+        // Keep privileges through the file operation. RTSP privacy checks take these locks in the same order.
+        std::lock_guard lock {client_auth_mutex()};
+        if (verify_client_certificate(certificate.get()) != nullptr) return;
+        const auto &profile = platf::aurora_profile();
+        result = get ? appearance::read(profile) : save ? appearance::save(profile, png) : appearance::reset(profile);
+      });
+    }
+    if (!result) {
+      aurora_text_response(response, StatusCode::client_error_forbidden, "denied");
+      return;
+    }
+    if (result->state == appearance::status::invalid_image) {
+      aurora_text_response(response, StatusCode::client_error_unprocessable_entity, "invalid-png");
+      return;
+    }
+    if (result->state == appearance::status::storage_error) {
+      aurora_text_response(response, StatusCode::server_error_internal_server_error, "storage-error");
+      return;
+    }
+
+    const bool custom = result->state == appearance::status::custom;
+    SimpleWeb::CaseInsensitiveMultimap headers {{"Cache-Control", "private, no-store"}, {"Connection", "close"}};
+    if (custom) headers.emplace("ETag", "\"" + result->digest + "\"");
+    if (!get) {
+      // The existing renderer keeps its current artwork and coverage until the next activation.
+      headers.emplace("X-Aurora-Privacy-Apply", "next-activation");
+      response->write(StatusCode::success_no_content, headers);
+    } else if (custom) {
+      headers.emplace("Content-Type", "image/png");
+      response->write(StatusCode::success_ok, result->png, headers);
+    } else {
+      response->write(StatusCode::success_no_content, headers);
+    }
+    response->close_connection_after_response = true;
+  #else
+    aurora_text_response(response, StatusCode::client_error_not_found, "unsupported");
+  #endif
+  }
+#endif
+
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   void aurora_session_privacy(https_server_t &server, resp_https_t response, req_https_t request) {
     using action_t = rtsp_stream::aurora_privacy_action;
@@ -2268,6 +2358,15 @@ namespace nvhttp {
     });
     https_server.resource["^/applist$"]["GET"] = authorized(applist);
     https_server.resource["^/appasset$"]["GET"] = authorized(appasset);
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+    const auto appearance = [&https_server](resp_https_t response, req_https_t request) {
+      aurora_privacy_appearance(https_server, response, request);
+    };
+    https_server.resource["^/aurora-privacy-appearance$"]["GET"] = appearance;
+    https_server.resource["^/aurora-privacy-appearance$"]["POST"] = appearance;
+    // Simple-Web-Server buffers request bodies before invoking a route. Leave room for HTTP framing.
+    https_server.config.max_request_streambuf_size = aurora::privacy_appearance::max_png_bytes + 16 * 1024;
+#endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
     https_server.resource["^/aurora-session-privacy$"]["POST"] = [&https_server](resp_https_t resp, req_https_t req) {
       aurora_session_privacy(https_server, resp, req);

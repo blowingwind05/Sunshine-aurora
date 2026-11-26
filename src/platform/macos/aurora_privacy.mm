@@ -17,6 +17,7 @@
 #include <utility>
 #include <unistd.h>
 
+#include "aurora_privacy_coverage.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/utility.h"
@@ -30,6 +31,7 @@ namespace aurora_privacy {
     uint64_t generation {};
     CGDirectDisplayID display {};
     CGWindowID window {};
+    std::atomic<coverage::clock::time_point> last_coverage {coverage::clock::time_point {}};  ///< Start time of the latest verified WindowServer snapshot.
     SCCapture *capture {};
     CMSampleBufferRef first_frame {};
 
@@ -65,6 +67,73 @@ namespace aurora_privacy {
              CGGetOnlineDisplayList(2, displays, &count) == kCGErrorSuccess && count == 1 &&
              displays[0] == display && CGDisplayIsBuiltin(display) && CGDisplayIsActive(display) &&
              !CGDisplayIsAsleep(display) && !CGDisplayIsInMirrorSet(display);
+    }
+
+    /** @brief Recheck the identity, opacity, layer and bounds of the existing AppKit window. */
+    bool curtain_matches(const session_ptr &session) {
+      if (!session->valid || curtain_generation != session->generation || !curtain.isVisible || !curtain.isOpaque ||
+          curtain.alphaValue != 1 || curtain.windowNumber != session->window ||
+          curtain.level != CGWindowLevelForKey(kCGMaximumWindowLevelKey) || !has_single_builtin_display(session->display)) {
+        return false;
+      }
+      NSArray<NSScreen *> *screens = NSScreen.screens;
+      NSScreen *screen = screens.firstObject;
+      return screens.count == 1 && [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == session->display &&
+             NSEqualRects(curtain.frame, screen.frame);
+    }
+
+    /** @brief Verify the current curtain and any intersecting windows in front of it. */
+    coverage::result inspect_curtain(const session_ptr &session) {
+      if (!curtain_matches(session)) {
+        return coverage::result::unconfirmed;
+      }
+
+      const auto options = static_cast<CGWindowListOption>(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements);
+      NSArray<NSDictionary *> *windows = CFBridgingRelease(CGWindowListCopyWindowInfo(options, kCGNullWindowID));
+      std::vector<coverage::window_t> observed;
+      for (NSDictionary *info in windows) {
+        NSNumber *id_value = info[(__bridge NSString *) kCGWindowNumber];
+        NSNumber *pid = info[(__bridge NSString *) kCGWindowOwnerPID];
+        NSNumber *layer = info[(__bridge NSString *) kCGWindowLayer];
+        NSNumber *alpha = info[(__bridge NSString *) kCGWindowAlpha];
+        NSDictionary *rect = info[(__bridge NSString *) kCGWindowBounds];
+        CGRect bounds {};
+        if (!id_value || !pid || !layer || !alpha || !rect ||
+            !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef) rect, &bounds)) {
+          return coverage::result::unconfirmed;
+        }
+        observed.push_back({
+          id_value.unsignedIntValue, pid.longLongValue, layer.longLongValue, alpha.doubleValue,
+          {bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height}
+        });
+        if (observed.back().id == session->window) {
+          break;
+        }
+      }
+      const auto bounds = CGDisplayBounds(session->display);
+      return coverage::inspect(observed, session->window, getpid(), CGWindowLevelForKey(kCGMaximumWindowLevelKey),
+                               {bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height});
+    }
+
+    /** @brief Reorder the same window once on a known same-level conflict and refresh the confirmation. */
+    bool confirm_curtain(const session_ptr &session) {
+      @autoreleasepool {
+        const auto started = coverage::clock::now();
+        const bool covered = coverage::confirm(
+          [&] { return inspect_curtain(session); },
+          [&] {
+            if (session->valid) {
+              BOOST_LOG(debug) << "Aurora privacy reordering the same curtain window " << session->window;
+              [curtain orderFrontRegardless];
+            }
+          }
+        );
+        if (!covered || !session->valid || !coverage::fresh(started, coverage::clock::now())) {
+          return false;
+        }
+        session->last_coverage = started;
+        return true;
+      }
     }
 
     void invalidate_curtain() {
@@ -132,7 +201,7 @@ namespace aurora_privacy {
       window.hasShadow = NO;
       window.ignoresMouseEvents = YES;
       window.hidesOnDeactivate = NO;
-      window.level = CGWindowLevelForKey(kCGScreenSaverWindowLevel);
+      window.level = CGWindowLevelForKey(kCGMaximumWindowLevelKey);
       window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                   NSWindowCollectionBehaviorFullScreenAuxiliary |
                                   NSWindowCollectionBehaviorStationary |
@@ -174,7 +243,7 @@ namespace aurora_privacy {
       }
       for (SCWindow *window in shareable.windows) {
         if (window.windowID == session->window && window.owningApplication.processID == getpid() &&
-            window.isOnScreen && window.windowLayer >= CGWindowLevelForKey(kCGScreenSaverWindowLevel) &&
+            window.isOnScreen && window.windowLayer == CGWindowLevelForKey(kCGMaximumWindowLevelKey) &&
             CGRectContainsRect(window.frame, display.frame)) {
           return [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[window]];
         }
@@ -201,8 +270,13 @@ namespace aurora_privacy {
       auto sleep_observer = [workspace_notifications addObserverForName:NSWorkspaceWillSleepNotification
                                                                 object:nil queue:NSOperationQueue.mainQueue usingBlock:invalidate];
       NSTimer *timer = [NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *) {
-        if (const auto session = curtain_session.lock()) {
-          if (!curtain.isVisible || !has_single_builtin_display(session->display)) {
+        if (const auto session = curtain_session.lock(); session && session->valid) {
+          const auto last = session->last_coverage.load();
+          const auto now = coverage::clock::now();
+          if (!curtain_matches(session) ||
+              (last != coverage::clock::time_point {} &&
+               (!coverage::fresh(last, now) || (now - last >= coverage::snapshot_interval && !confirm_curtain(session))))) {
+            BOOST_LOG(warning) << "Aurora privacy could not confirm local curtain coverage";
             session->valid = false;
           }
         }
@@ -268,6 +342,19 @@ namespace aurora_privacy {
       if (!filter || !session->valid) {
         return {};
       }
+
+      // The excluded ID must also be the opaque, unobstructed curtain seen by WindowServer.
+      auto confirmation = std::make_shared<std::promise<bool>>();
+      auto confirmed = confirmation->get_future();
+      dispatch_async(dispatch_get_main_queue(), ^{
+        confirmation->set_value(confirm_curtain(session));
+      });
+      if (confirmed.wait_for(1s) != std::future_status::ready || !confirmed.get() || !session->valid) {
+        BOOST_LOG(warning) << "Aurora privacy could not verify the excluded curtain before capture";
+        return {};
+      }
+      BOOST_LOG(debug) << "Aurora privacy verified excluded curtain window " << session->window;
+
       session->capture = [[SCCapture alloc] initWithFilter:filter width:width height:height frameRate:fps];
       if (![session->capture start]) {
         return {};
@@ -305,7 +392,17 @@ namespace aurora_privacy {
   }
 
   bool healthy(const session_ptr &session) {
-    return session->valid && ![session->capture failed];
+    if (!session->valid) {
+      return false;
+    }
+    const auto last = session->last_coverage.load();
+    if (!coverage::fresh(last, coverage::clock::now())) {
+      if (session->valid.exchange(false)) {
+        BOOST_LOG(warning) << "Aurora privacy curtain coverage confirmation expired";
+      }
+      return false;
+    }
+    return ![session->capture failed] && session->valid;
   }
 
   CGDirectDisplayID display_id(const session_ptr &session) {

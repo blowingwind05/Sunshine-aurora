@@ -757,6 +757,19 @@ namespace rtsp_stream {
       return insert_result::accepted;
     }
 
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || (defined(__APPLE__) && defined(AURORA_MACOS_PRIVACY_PREVIEW)))
+    /** @brief Serialize the appearance operation with session admission and removal. */
+    bool with_privacy_appearance_owner(std::string_view cert, const std::function<void()> &operation) {
+      auto lock = _session_slots.lock();
+      if (cert.empty() || _session_slots->size() != 1) return false;
+      auto &slot = **_session_slots->begin();
+      if (stream::session::state(slot) != stream::session::state_e::RUNNING ||
+          stream::session::client_cert(slot) != cert) return false;
+      operation();
+      return true;
+    }
+#endif
+
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
     /** @brief Submit control only to the sole live session owned by the paired TLS peer. */
     std::string session_bitrate(std::string_view cert, const aurora::video_bitrate::request_t &request) {
@@ -892,6 +905,12 @@ namespace rtsp_stream {
   };
 
   rtsp_server_t server {};  ///< Singleton RTSP server used by GameStream launch sessions.
+
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || (defined(__APPLE__) && defined(AURORA_MACOS_PRIVACY_PREVIEW)))
+  bool aurora_with_privacy_appearance_owner(std::string_view cert, const std::function<void()> &operation) {
+    return server.with_privacy_appearance_owner(cert, operation);
+  }
+#endif
 
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   std::string_view aurora_session_privacy(std::string_view cert, aurora_privacy_action action) {

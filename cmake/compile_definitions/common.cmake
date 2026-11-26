@@ -216,6 +216,14 @@ if(NOT APPLE)
     include_directories(BEFORE SYSTEM "${NV_CODEC_HEADERS_13_1_INCLUDE_DIR}")
 endif()
 
+if(AURORA_SUNSHINE_HOST AND (WIN32 OR APPLE))
+    find_package(ZLIB REQUIRED)
+    list(APPEND SUNSHINE_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/aurora_privacy_appearance.h"
+            "${CMAKE_SOURCE_DIR}/src/aurora_privacy_appearance.cpp")
+    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES ZLIB::ZLIB)
+endif()
+
 if(NOT AURORA_SUNSHINE_HOST)
     list(APPEND SUNSHINE_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/upnp.cpp"
