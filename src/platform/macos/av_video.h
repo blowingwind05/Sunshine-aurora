@@ -69,9 +69,13 @@ typedef bool (^FrameCallbackBlock)(CMSampleBufferRef);
  *
  * @param displayID Display ID.
  * @param frameRate Frame rate.
+ * @param excludeCursor Whether to exclude the cursor from captured video.
  * @return Initialized AVVideo instance, or nil on failure.
  */
-- (id)initWithDisplay:(CGDirectDisplayID)displayID frameRate:(int)frameRate;
+- (id)initWithDisplay:(CGDirectDisplayID)displayID frameRate:(int)frameRate excludeCursor:(BOOL)excludeCursor;
+
+/** @brief Verify cursor exclusion on a screen input without starting capture. */
++ (BOOL)canExcludeCursorForDisplay:(CGDirectDisplayID)displayID;
 
 /**
  * @brief Set frame width frame height.

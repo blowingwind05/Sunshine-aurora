@@ -5,9 +5,26 @@
 // local includes
 #import "av_video.h"
 
+/** @brief Exclude the cursor from this screen input and verify the resulting setting. */
+static BOOL excludeScreenCursor(AVCaptureScreenInput *input) {
+  if (![input respondsToSelector:@selector(setCapturesCursor:)] ||
+      ![input respondsToSelector:@selector(capturesCursor)]) {
+    return NO;
+  }
+  [input setCapturesCursor:NO];
+  return ![input capturesCursor];
+}
+
 @implementation AVVideo
 
-- (id)initWithDisplay:(CGDirectDisplayID)displayID frameRate:(int)frameRate {
++ (BOOL)canExcludeCursorForDisplay:(CGDirectDisplayID)displayID {
+  AVCaptureScreenInput *input = [[AVCaptureScreenInput alloc] initWithDisplayID:displayID];
+  BOOL supported = excludeScreenCursor(input);
+  [input release];
+  return supported;
+}
+
+- (id)initWithDisplay:(CGDirectDisplayID)displayID frameRate:(int)frameRate excludeCursor:(BOOL)excludeCursor {
   self = [super init];
 
   CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displayID);
@@ -29,6 +46,11 @@
   CFRelease(mode);
 
   AVCaptureScreenInput *screenInput = [[AVCaptureScreenInput alloc] initWithDisplayID:self.displayID];
+  if (excludeCursor && !excludeScreenCursor(screenInput)) {
+    [screenInput release];
+    [self release];
+    return nil;
+  }
   [screenInput setMinFrameDuration:self.minFrameDuration];
 
   if ([self.session canAddInput:screenInput]) {

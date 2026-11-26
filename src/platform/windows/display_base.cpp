@@ -1022,6 +1022,10 @@ namespace platf {
 #else
     const bool wgc_only = false;
 #endif
+    if (config.aurora_client_cursor && !wgc_only) {
+      BOOST_LOG(warning) << "The negotiated Aurora cursor mode requires Windows Graphics Capture";
+      return nullptr;
+    }
     if (!wgc_only && (config::video.capture == "ddx" || config::video.capture.empty())) {
       if (hwdevice_type == mem_type_e::dxgi) {
         auto disp = std::make_shared<dxgi::display_ddup_vram_t>();

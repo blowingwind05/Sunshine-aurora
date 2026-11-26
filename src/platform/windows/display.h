@@ -716,12 +716,21 @@ namespace platf::dxgi {
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame consumed_frame {nullptr};
     SRWLOCK frame_lock = SRWLOCK_INIT;
     CONDITION_VARIABLE frame_present_cv;
+    bool excludes_cursor = false;  ///< The verified cursor exclusion setting for this capture session.
+
+    bool create_session(ID3D11Device *device, HMONITOR monitor, DXGI_FORMAT format);
+    bool exclude_cursor();
 
     void on_frame_arrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender, winrt::Windows::Foundation::IInspectable const &);
 
   public:
     wgc_capture_t();
     ~wgc_capture_t();
+
+#ifdef AURORA_SUNSHINE_HOST
+    /** @brief Verify cursor exclusion on a WGC session without starting capture. */
+    static bool can_exclude_cursor(ID3D11Device *device, HMONITOR monitor);
+#endif
 
     /**
      * @brief Initialize D3D cursor rendering resources for GPU capture.

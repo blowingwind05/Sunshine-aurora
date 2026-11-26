@@ -923,6 +923,15 @@ namespace platf {
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
 
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+  /**
+   * @brief Verify that the selected capture path can exclude the cursor before streaming.
+   * @param display_name Mapped platform name of the configured display.
+   * @return True if the cursor-exclusion setting was verified on the selected backend.
+   */
+  bool aurora_can_exclude_client_cursor(const std::string &display_name);
+#endif
+
   // A list of names of displays accepted as display_name with the mem_type_e
   /**
    * @brief List display names accepted by the selected capture backend.

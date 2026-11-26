@@ -13,6 +13,7 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -595,31 +596,52 @@ namespace rtsp_stream {
      * @note If the client does not begin streaming within the ping_timeout,
      *       the session will be discarded.
      * @param launch_session Streaming session information.
+     * @return The cursor mode granted to this launch, or a pending cursor handshake conflict.
      */
-    void session_raise(std::shared_ptr<launch_session_t> launch_session) {
-      // If a launch event is still pending, don't overwrite it.
-      if (launch_event.view(0s)) {
-        return;
+    aurora::client_cursor::launch_result session_raise(std::shared_ptr<launch_session_t> launch_session) {
+      using aurora::client_cursor::launch_result;
+      auto slots_lock = _session_slots.lock();
+      std::lock_guard launch_lock {_launch_mutex};
+      const auto pending = launch_event.view(0s);
+      const auto result = aurora::client_cursor::negotiate(
+        launch_session->aurora_client_cursor,
+        static_cast<bool>(pending),
+        pending && pending->aurora_client_cursor,
+        !_session_slots->empty(),
+        _active_excludes_cursor
+      );
+      if (pending) {
+        return result;
       }
 
-      // Raise the new launch session to prepare for the RTSP handshake
+      const auto launch_session_id = launch_session->id;
+      launch_session->aurora_client_cursor = result == launch_result::cursorless;
       launch_event.raise(std::move(launch_session));
 
       // Arm the timer to expire this launch session if the client times out
       raised_timer.expires_after(config::stream.ping_timeout);
-      raised_timer.async_wait([this](const boost::system::error_code &ec) {
-        if (!ec) {
-          auto discarded = launch_event.pop(0s);
-          if (discarded) {
-            BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
-#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
-            if (!config::aurora_display_id.empty() && session_count() == 0) {
-              display_device::revert_configuration();
-            }
-#endif
+      raised_timer.async_wait([this, launch_session_id](const boost::system::error_code &ec) {
+        if (ec) {
+          return;
+        }
+        std::shared_ptr<launch_session_t> discarded;
+        {
+          std::lock_guard lock {_launch_mutex};
+          const auto pending = launch_event.view(0s);
+          if (pending && pending->id == launch_session_id) {
+            discarded = launch_event.pop(0s);
           }
         }
+        if (discarded) {
+          BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+#if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
+          if (!config::aurora_display_id.empty() && session_count() == 0) {
+            display_device::revert_configuration();
+          }
+#endif
+        }
       });
+      return result;
     }
 
     /**
@@ -627,6 +649,7 @@ namespace rtsp_stream {
      * @param launch_session_id The ID of the session to clear.
      */
     void session_clear(uint32_t launch_session_id) {
+      std::lock_guard lock {_launch_mutex};
       // We currently only support a single pending RTSP session,
       // so the ID should always match the one for that session.
       auto launch_session = launch_event.view(0s);
@@ -647,6 +670,12 @@ namespace rtsp_stream {
     int session_count() {
       auto lg = _session_slots.lock();
       return (int) _session_slots->size();
+    }
+
+    /** @brief Whether a confirmed cursor launch already owns the pending slot. */
+    bool cursor_launch_pending() {
+      const auto pending = launch_event.view(0s);
+      return pending && pending->aurora_client_cursor;
     }
 
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;  ///< Launch event.
@@ -702,20 +731,30 @@ namespace rtsp_stream {
       _session_slots->erase(session);
     }
 
+    /** @brief Result of admitting a stream to the shared capture. */
+    enum class insert_result { accepted, privacy_conflict, cursor_conflict };
+
     /**
      * @brief Inserts the provided session into the set of sessions.
      * @param session The session to insert.
+     * @param excludes_cursor Whether the session requires video without the host cursor.
+     * @return The admission result.
      */
-    [[nodiscard]] bool insert(const std::shared_ptr<stream::session_t> &session) {
+    [[nodiscard]] insert_result insert(const std::shared_ptr<stream::session_t> &session, bool excludes_cursor) {
       auto lg = _session_slots.lock();
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
       if (std::ranges::any_of(*_session_slots, [](const auto &slot) {
             return stream::session::aurora_privacy_owned(*slot) || stream::session::aurora_displays_owned(*slot);
-          })) return false;
+          })) return insert_result::privacy_conflict;
 #endif
+      if (!aurora::client_cursor::compatible(!_session_slots->empty(), _active_excludes_cursor, excludes_cursor)) {
+        return insert_result::cursor_conflict;
+      }
+
       _session_slots->emplace(session);
+      _active_excludes_cursor = excludes_cursor;
       BOOST_LOG(info) << "New streaming session started [active sessions: "sv << _session_slots->size() << ']';
-      return true;
+      return insert_result::accepted;
     }
 
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
@@ -839,9 +878,11 @@ namespace rtsp_stream {
     std::unordered_map<std::string_view, cmd_func_t> _map_cmd_cb;
 
     sync_util::sync_t<std::set<std::shared_ptr<stream::session_t>>> _session_slots;
+    bool _active_excludes_cursor = false;  ///< Protected by _session_slots, meaningful while it is nonempty.
 
     boost::asio::io_context io_context;
     tcp::acceptor acceptor {io_context};
+    std::mutex _launch_mutex;  ///< Serializes publication and expiry of the pending launch ticket.
     boost::asio::steady_timer raised_timer {io_context};
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
     std::chrono::steady_clock::time_point privacy_check_due {};
@@ -865,8 +906,12 @@ namespace rtsp_stream {
   /**
    * @brief Queue a launch session until the RTSP client connects.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
-    server.session_raise(std::move(launch_session));
+  aurora::client_cursor::launch_result launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    return server.session_raise(std::move(launch_session));
+  }
+
+  bool cursor_launch_pending() {
+    return server.cursor_launch_pending();
   }
 
   void launch_session_clear(uint32_t launch_session_id) {
@@ -1331,6 +1376,7 @@ namespace rtsp_stream {
       config.monitor.numRefFrames = (int) util::from_view(args.at("x-nv-video[0].maxNumReferenceFrames"sv));
       config.monitor.encoderCscMode = (int) util::from_view(args.at("x-nv-video[0].encoderCscMode"sv));
       config.monitor.videoFormat = (int) util::from_view(args.at("x-nv-vqos[0].bitStreamFormat"sv));
+      config.monitor.aurora_client_cursor = session.aurora_client_cursor;
       config.monitor.dynamicRange = (int) util::from_view(args.at("x-nv-video[0].dynamicRangeMode"sv));
       config.monitor.chromaSamplingType = (int) util::from_view(args.at("x-ss-video[0].chromaSamplingType"sv));
       config.monitor.enableIntraRefresh = (int) util::from_view(args.at("x-ss-video[0].intraRefresh"sv));
@@ -1454,9 +1500,15 @@ namespace rtsp_stream {
 #endif
 
     auto stream_session = stream::session::alloc(config, session);
-    if (!server->insert(stream_session)) {
-      respond(sock, session, &option, 503, "ANOTHER SESSION OWNS THE PRIVACY SCREEN", req->sequenceNumber, {});
-      return;
+    switch (server->insert(stream_session, config.monitor.aurora_client_cursor)) {
+      case rtsp_server_t::insert_result::privacy_conflict:
+        respond(sock, session, &option, 503, "ANOTHER SESSION OWNS THE PRIVACY SCREEN", req->sequenceNumber, {});
+        return;
+      case rtsp_server_t::insert_result::cursor_conflict:
+        respond(sock, session, &option, 503, "ANOTHER SESSION USES AN INCOMPATIBLE CURSOR MODE", req->sequenceNumber, {});
+        return;
+      case rtsp_server_t::insert_result::accepted:
+        break;
     }
 
     if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string())) {

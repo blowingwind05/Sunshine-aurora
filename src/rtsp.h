@@ -8,6 +8,7 @@
 #include <atomic>
 
 // local includes
+#include "aurora_client_cursor.h"
 #include "crypto.h"
 #include "thread_safe.h"
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
@@ -37,6 +38,7 @@ namespace rtsp_stream {
     std::string av_ping_payload;  ///< AV ping payload.
     uint32_t control_connect_data;  ///< Client-provided token used when connecting the control channel.
 
+    bool aurora_client_cursor = false;  ///< Exclude the cursor from captured video after successful negotiation.
     bool host_audio;  ///< Whether host audio should be played locally.
     std::string unique_id;  ///< Moonlight client unique identifier for this launch request.
     int width;  ///< Frame or display width in pixels.
@@ -61,8 +63,12 @@ namespace rtsp_stream {
    * @brief Queue a launch session until the RTSP client connects.
    *
    * @param launch_session Session state prepared by the GameStream launch handler.
+   * @return The cursor mode granted to this launch, or a pending cursor handshake conflict.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+  aurora::client_cursor::launch_result launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+
+  /** @brief Whether a confirmed cursor launch already owns the pending slot. */
+  bool cursor_launch_pending();
 
   /**
    * @brief Clear state for the specified launch session.

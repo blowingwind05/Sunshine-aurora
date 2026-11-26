@@ -287,6 +287,22 @@ namespace platf {
   };
 #endif
 
+#ifdef AURORA_SUNSHINE_HOST
+  bool aurora_can_exclude_client_cursor(const std::string &display_name) {
+    if (config::aurora_privacy_screensaver) {
+      return false;
+    }
+  #ifdef AURORA_MACOS_PRIVACY_PREVIEW
+    if (aurora_privacy::current()) {
+      return false;
+    }
+  #endif
+    @autoreleasepool {
+      return [AVVideo canExcludeCursorForDisplay:parse_display_id(display_name).value_or(CGMainDisplayID())];
+    }
+  }
+#endif
+
   std::shared_ptr<display_t> display(platf::mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
     if (hwdevice_type != platf::mem_type_e::system && hwdevice_type != platf::mem_type_e::videotoolbox) {
       BOOST_LOG(error) << "Could not initialize display with the given hw device type."sv;
@@ -295,6 +311,10 @@ namespace platf {
 
 #ifdef AURORA_MACOS_PRIVACY_PREVIEW
     if (auto privacy = aurora_privacy::current()) {
+      if (config.aurora_client_cursor) {
+        BOOST_LOG(warning) << "The negotiated Aurora cursor mode is unavailable in privacy preview capture";
+        return nullptr;
+      }
       if (hwdevice_type != mem_type_e::videotoolbox || !aurora_privacy::healthy(privacy)) {
         return nullptr;
       }
@@ -354,7 +374,7 @@ namespace platf {
 
     BOOST_LOG(info) << "Configuring selected display ("sv << display->display_id << ") to stream"sv;
 
-    display->av_capture = [[AVVideo alloc] initWithDisplay:display->display_id frameRate:config.framerate];
+    display->av_capture = [[AVVideo alloc] initWithDisplay:display->display_id frameRate:config.framerate excludeCursor:config.aurora_client_cursor];
 
     if (!display->av_capture) {
       BOOST_LOG(error) << "Video setup failed."sv;

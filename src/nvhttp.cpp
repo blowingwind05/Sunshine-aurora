@@ -30,6 +30,7 @@
 #endif
 
 // local includes
+#include "aurora_client_cursor.h"
 #include "config.h"
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
   #include "aurora_capture_geometry.h"
@@ -1586,6 +1587,41 @@ namespace nvhttp {
   }
 #endif
 
+  /** @brief Report a busy launch slot without offering an RTSP URL for a different cursor handshake. */
+  void reject_pending_cursor_launch(pt::ptree &tree, const char *success_field) {
+    tree.put("root.<xmlattr>.status_code", 503);
+    tree.put("root.<xmlattr>.status_message", "Another Aurora cursor launch is pending");
+    tree.put(success_field, 0);
+    tree.get_child("root").erase("sessionUrl0");
+  }
+
+  /**
+   * @brief Queue the usual RTSP launch and acknowledge a verified client-cursor capture.
+   * @return False when an outstanding cursor handshake prevents using the pending launch slot.
+   */
+  bool queue_stream_launch(pt::ptree &tree, const char *success_field, const args_t &args, const paired_identity_t *identity, const std::shared_ptr<rtsp_stream::launch_session_t> &session) {
+#if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
+    if (aurora::client_cursor::requested(args, identity && !identity->first.empty())) {
+      session->aurora_client_cursor = platf::aurora_can_exclude_client_cursor(display_device::map_output_name(config::video.output_name));
+    }
+#else
+    (void) args;
+    (void) identity;
+#endif
+    using aurora::client_cursor::launch_result;
+    switch (rtsp_stream::launch_session_raise(session)) {
+      case launch_result::pending_conflict:
+        reject_pending_cursor_launch(tree, success_field);
+        return false;
+      case launch_result::cursorless:
+        tree.put("root.AuroraClientCursor", 1);
+        break;
+      case launch_result::legacy:
+        break;
+    }
+    return true;
+  }
+
   /**
    * @brief Launch the requested application for a GameStream session.
    *
@@ -1640,6 +1676,11 @@ namespace nvhttp {
     }
 
     video::wait_for_initial_encoder_probe();
+
+    if (rtsp_stream::cursor_launch_pending()) {
+      reject_pending_cursor_launch(tree, "root.gamesession");
+      return;
+    }
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args, identity);
@@ -1706,7 +1747,12 @@ namespace nvhttp {
     );
     tree.put("root.gamesession", 1);
 
-    rtsp_stream::launch_session_raise(launch_session);
+    if (!queue_stream_launch(tree, "root.gamesession", args, identity, launch_session)) {
+      if (appid > 0) {
+        proc::proc.terminate();
+      }
+      return;
+    }
 
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
@@ -1763,6 +1809,11 @@ namespace nvhttp {
     }
 
     video::wait_for_initial_encoder_probe();
+
+    if (rtsp_stream::cursor_launch_pending()) {
+      reject_pending_cursor_launch(tree, "root.resume");
+      return;
+    }
 
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
@@ -1822,7 +1873,9 @@ namespace nvhttp {
     );
     tree.put("root.resume", 1);
 
-    rtsp_stream::launch_session_raise(launch_session);
+    if (!queue_stream_launch(tree, "root.resume", args, identity, launch_session)) {
+      return;
+    }
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
     revert_privacy_configuration = false;
 #endif

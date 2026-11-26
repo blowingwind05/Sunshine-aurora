@@ -9,6 +9,11 @@
 #include "display.h"
 #include "misc.h"
 #include "src/logging.h"
+#ifdef AURORA_SUNSHINE_HOST
+  #include "src/config.h"
+  #include "src/display_device.h"
+  #include "utf_utils.h"
+#endif
 
 // Gross hack to work around MINGW-packages#22160
 #define ____FIReference_1_boolean_INTERFACE_DEFINED__
@@ -96,56 +101,65 @@ namespace platf::dxgi {
     frame_pool = nullptr;
   }
 
-  /**
-   * @brief Initialize the Windows.Graphics.Capture backend.
-   * @return 0 on success, -1 on failure.
-   */
-  int wgc_capture_t::init(display_base_t *display, const ::video::config_t &config) {
-    HRESULT status;
-    dxgi::dxgi_t dxgi;
-    winrt::com_ptr<::IInspectable> d3d_comhandle;
+  /** @brief Create matching WGC objects for production capture and the cursor preflight. */
+  bool wgc_capture_t::create_session(ID3D11Device *device, HMONITOR monitor, DXGI_FORMAT format) {
     try {
       if (!winrt::GraphicsCaptureSession::IsSupported()) {
-        BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows!"sv;
-        return -1;
+        return false;
       }
-      if (FAILED(status = display->device->QueryInterface(IID_IDXGIDevice, (void **) &dxgi))) {
-        BOOST_LOG(error) << "Failed to query DXGI interface from device [0x"sv << util::hex(status).to_string_view() << ']';
-        return -1;
-      }
-      if (FAILED(status = winrt::CreateDirect3D11DeviceFromDXGIDevice(*&dxgi, d3d_comhandle.put()))) {
-        BOOST_LOG(error) << "Failed to query WinRT DirectX interface from device [0x"sv << util::hex(status).to_string_view() << ']';
-        return -1;
-      }
-    } catch (winrt::hresult_error &e) {
-      BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to acquire device: [0x"sv << util::hex(e.code()).to_string_view() << ']';
-      return -1;
-    }
 
-    DXGI_OUTPUT_DESC output_desc;
-    uwp_device = d3d_comhandle.as<winrt::IDirect3DDevice>();
-    display->output->GetDesc(&output_desc);
+      dxgi_t dxgi;
+      winrt::check_hresult(device->QueryInterface(IID_IDXGIDevice, (void **) &dxgi));
+      winrt::com_ptr<::IInspectable> d3d_comhandle;
+      winrt::check_hresult(winrt::CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(), d3d_comhandle.put()));
+      uwp_device = d3d_comhandle.as<winrt::IDirect3DDevice>();
 
-    auto monitor_factory = winrt::get_activation_factory<winrt::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-    if (monitor_factory == nullptr || FAILED(status = monitor_factory->CreateForMonitor(output_desc.Monitor, winrt::guid_of<winrt::IGraphicsCaptureItem>(), winrt::put_abi(item)))) {
-      BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to acquire display: [0x"sv << util::hex(status).to_string_view() << ']';
-      return -1;
-    }
-
-    if (config.dynamicRange) {
-      display->capture_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    } else {
-      display->capture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    }
-
-    try {
-      frame_pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(uwp_device, static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(display->capture_format), 2, item.Size());
+      auto factory = winrt::get_activation_factory<winrt::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+      winrt::check_hresult(factory->CreateForMonitor(monitor, winrt::guid_of<winrt::IGraphicsCaptureItem>(), winrt::put_abi(item)));
+      frame_pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(
+        uwp_device, static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(format), 2, item.Size()
+      );
       capture_session = frame_pool.CreateCaptureSession(item);
-      frame_pool.FrameArrived({this, &wgc_capture_t::on_frame_arrived});
-    } catch (winrt::hresult_error &e) {
-      BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to create capture session: [0x"sv << util::hex(e.code()).to_string_view() << ']';
+      return true;
+    } catch (const winrt::hresult_error &e) {
+      BOOST_LOG(warning) << "Could not create a Windows Graphics Capture session: [0x"sv << util::hex(e.code()).to_string_view() << ']';
+      return false;
+    }
+  }
+
+  /** @brief Disable WGC cursor composition and require a false readback. */
+  bool wgc_capture_t::exclude_cursor() {
+    try {
+      capture_session.IsCursorCaptureEnabled(false);
+      return !capture_session.IsCursorCaptureEnabled();
+    } catch (const winrt::hresult_error &) {
+      return false;
+    }
+  }
+
+#ifdef AURORA_SUNSHINE_HOST
+  bool wgc_capture_t::can_exclude_cursor(ID3D11Device *device, HMONITOR monitor) {
+    wgc_capture_t probe;
+    return probe.create_session(device, monitor, DXGI_FORMAT_B8G8R8A8_UNORM) && probe.exclude_cursor();
+  }
+#endif
+
+  int wgc_capture_t::init(display_base_t *display, const ::video::config_t &config) {
+    DXGI_OUTPUT_DESC output_desc {};
+    if (FAILED(display->output->GetDesc(&output_desc))) {
       return -1;
     }
+
+    display->capture_format = config.dynamicRange ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (!create_session(display->device.get(), output_desc.Monitor, display->capture_format)) {
+      return -1;
+    }
+    if (config.aurora_client_cursor && !exclude_cursor()) {
+      BOOST_LOG(warning) << "Windows Graphics Capture could not verify the negotiated Aurora cursor mode";
+      return -1;
+    }
+    excludes_cursor = config.aurora_client_cursor;
+
     try {
       if (winrt::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"IsBorderRequired")) {
         capture_session.IsBorderRequired(false);
@@ -165,6 +179,7 @@ namespace platf::dxgi {
       BOOST_LOG(warning) << "Screen capture may be capped to 60fps on this device for this release of Windows: failed to set MinUpdateInterval: [0x"sv << util::hex(e.code()).to_string_view() << ']';
     }
     try {
+      frame_pool.FrameArrived({this, &wgc_capture_t::on_frame_arrived});
       capture_session.StartCapture();
     } catch (winrt::hresult_error &e) {
       BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to start capture: [0x"sv << util::hex(e.code()).to_string_view() << ']';
@@ -242,6 +257,10 @@ namespace platf::dxgi {
   }
 
   int wgc_capture_t::set_cursor_visible(bool x) {
+    if (excludes_cursor) {
+      return 0;
+    }
+
     try {
       if (capture_session.IsCursorCaptureEnabled() != x) {
         capture_session.IsCursorCaptureEnabled(x);
@@ -353,3 +372,56 @@ namespace platf::dxgi {
     return dup.release_frame();
   }
 }  // namespace platf::dxgi
+
+#ifdef AURORA_SUNSHINE_HOST
+namespace platf {
+  bool aurora_can_exclude_client_cursor(const std::string &display_name) {
+    if (!display_device::aurora_wgc_capture_selected()) {
+      return false;
+    }
+
+    const auto apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(apartment) && apartment != RPC_E_CHANGED_MODE) {
+      return false;
+    }
+    auto uninitialize = util::fail_guard([apartment] {
+      if (SUCCEEDED(apartment)) {
+        CoUninitialize();
+      }
+    });
+
+    const auto output_name = utf_utils::from_utf8(display_name);
+    const auto adapter_name = utf_utils::from_utf8(config::video.adapter_name);
+    dxgi::factory1_t factory;
+    if (FAILED(CreateDXGIFactory1(IID_IDXGIFactory1, (void **) &factory))) {
+      return false;
+    }
+
+    dxgi::adapter_t adapter;
+    for (UINT i = 0; SUCCEEDED(factory->EnumAdapters1(i, &adapter)); ++i, adapter.reset()) {
+      DXGI_ADAPTER_DESC1 adapter_desc {};
+      if (FAILED(adapter->GetDesc1(&adapter_desc)) ||
+          (!adapter_name.empty() && adapter_name != adapter_desc.Description)) {
+        continue;
+      }
+
+      dxgi::output_t output;
+      for (UINT j = 0; SUCCEEDED(adapter->EnumOutputs(j, &output)); ++j, output.reset()) {
+        DXGI_OUTPUT_DESC desc {};
+        if (FAILED(output->GetDesc(&desc)) || !desc.AttachedToDesktop ||
+            (!output_name.empty() && output_name != desc.DeviceName)) {
+          continue;
+        }
+
+        dxgi::device_t device;
+        return SUCCEEDED(D3D11CreateDevice(
+                 adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, dxgi::D3D11_CREATE_DEVICE_FLAGS,
+                 nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr
+               )) &&
+               dxgi::wgc_capture_t::can_exclude_cursor(device.get(), desc.Monitor);
+      }
+    }
+    return false;
+  }
+}  // namespace platf
+#endif
