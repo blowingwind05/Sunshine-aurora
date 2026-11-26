@@ -41,6 +41,7 @@
     #include <thread>
     #include <dwmapi.h>
     #include <setupapi.h>
+    #include "AuroraHostPrivacyImage.h"
   #endif
 #endif
 
@@ -1096,16 +1097,25 @@ namespace display_device {
       return monitors;
     }
 
+    /** @brief Paint one native curtain using the worker's immutable artwork snapshot. */
     LRESULT CALLBACK curtain_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+      if (message == WM_NCCREATE) {
+        const auto create = reinterpret_cast<const CREATESTRUCTW *>(lparam);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+      }
       if (message == WM_PAINT) {
         PAINTSTRUCT paint {};
         const auto dc = BeginPaint(window, &paint);
         RECT bounds {};
         GetClientRect(window, &bounds);
-        FillRect(dc, &bounds, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(188, 203, 222));
-        DrawTextW(dc, L"Aurora  |  隐私屏保", -1, &bounds, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+        const auto image = reinterpret_cast<const aurora::host::PrivacyScreensaverImage *>(
+          GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (!image || !image->paint(dc, bounds)) {
+          FillRect(dc, &bounds, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+          SetBkMode(dc, TRANSPARENT);
+          SetTextColor(dc, RGB(188, 203, 222));
+          DrawTextW(dc, L"Aurora  |  隐私屏保", -1, &bounds, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+        }
         EndPaint(window, &paint);
         return 0;
       }
@@ -1159,6 +1169,7 @@ namespace display_device {
           return;
         }
         const auto unregister = util::fail_guard([&] { UnregisterClassW(curtain_class, instance); });
+        auto image = aurora::host::PrivacyScreensaverImage::load(platf::aurora_profile());
         std::vector<HWND> windows;
         windows.reserve(monitors->size());
         const auto close_windows = util::fail_guard([&] {
@@ -1170,7 +1181,7 @@ namespace display_device {
           const auto &rect = monitor.rectangle;
           const auto window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, curtain_class,
             L"Aurora Privacy Screen", WS_POPUP | WS_DISABLED, rect.left, rect.top, rect.right - rect.left,
-            rect.bottom - rect.top, nullptr, nullptr, instance, nullptr);
+            rect.bottom - rect.top, nullptr, nullptr, instance, image ? &*image : nullptr);
           if (!window) {
             BOOST_LOG(warning) << "Aurora could not create a privacy screen window: " << GetLastError();
             return;
@@ -1260,8 +1271,9 @@ namespace display_device {
     if (curtain.sessions == 0) {
       if (!aurora_screensaver_supported() || !aurora_wgc_capture_selected()) return false;
       try {
-        if (aurora::host::privacy_uiaccess_requested(platf::aurora_profile())) {
-          curtain.test_overlay = aurora::host::PrivacyTestOverlay::start();
+        const auto &profile = platf::aurora_profile();
+        if (aurora::host::privacy_uiaccess_requested(profile)) {
+          curtain.test_overlay = aurora::host::PrivacyTestOverlay::start(profile);
           if (!curtain.test_overlay) {
             BOOST_LOG(warning) << "Aurora could not start the installed UIAccess privacy test overlay";
             return false;

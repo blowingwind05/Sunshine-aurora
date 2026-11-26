@@ -6,13 +6,15 @@ if(AURORA_MACOS_PRIVACY_PREVIEW)
         message(FATAL_ERROR "The Aurora macOS privacy curtain requires AURORA_SUNSHINE_HOST")
     endif()
     find_library(SCREEN_CAPTURE_KIT_LIBRARY ScreenCaptureKit REQUIRED)
+    find_library(AURORA_IMAGE_IO_LIBRARY ImageIO REQUIRED)
     set(aurora_privacy_sources
         "${CMAKE_SOURCE_DIR}/src/platform/macos/aurora_privacy.mm"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/aurora_privacy_artwork.mm"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_capture.mm")
     target_sources(${sunshine_engine_target} PRIVATE ${aurora_privacy_sources})
     set_source_files_properties(${aurora_privacy_sources} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_compile_definitions(${sunshine_engine_target} PRIVATE AURORA_MACOS_PRIVACY_PREVIEW=1)
-    target_link_libraries(${sunshine_engine_target} ${SCREEN_CAPTURE_KIT_LIBRARY})
+    target_link_libraries(${sunshine_engine_target} ${SCREEN_CAPTURE_KIT_LIBRARY} ${AURORA_IMAGE_IO_LIBRARY})
 endif()
 
 if (SUNSHINE_BUILD_HOMEBREW)

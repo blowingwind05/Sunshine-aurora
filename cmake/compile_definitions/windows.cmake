@@ -107,3 +107,7 @@ list(PREPEND PLATFORM_LIBRARIES
         ws2_32
         wsock32
 )
+
+if(AURORA_SUNSHINE_HOST)
+    list(APPEND PLATFORM_LIBRARIES windowscodecs)
+endif()

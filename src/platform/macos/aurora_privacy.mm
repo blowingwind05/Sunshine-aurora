@@ -3,9 +3,11 @@
  * @brief Local AppKit curtain and ScreenCaptureKit exclusion for Aurora.
  */
 #include "aurora_privacy.h"
+#include "aurora_privacy_artwork.h"
 #include "sc_capture.h"
 
 #import <AppKit/AppKit.h>
+#import <dispatch/dispatch.h>
 
 #include <atomic>
 #include <future>
@@ -16,6 +18,7 @@
 #include <unistd.h>
 
 #include "src/logging.h"
+#include "src/platform/common.h"
 #include "src/utility.h"
 
 namespace aurora_privacy {
@@ -79,6 +82,29 @@ namespace aurora_privacy {
       }
     }
 
+    /**
+     * @brief Load optional artwork off the AppKit thread and install it on the owning curtain.
+     * @param generation The curtain generation that requested the artwork.
+     */
+    void load_curtain_artwork(uint64_t generation) {
+      dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+          const auto image = load_artwork(platf::aurora_profile());
+          if (!image) {
+            return;
+          }
+          dispatch_async(dispatch_get_main_queue(), ^{
+            if (const auto session = curtain_session.lock();
+                curtain_generation == generation && session && session->valid && curtain.isVisible) {
+              NSView *content = curtain.contentView;
+              [content addSubview:create_artwork_view(content.bounds, image)];
+            }
+            CGImageRelease(image);
+          });
+        }
+      });
+    }
+
     bool show_curtain(const session_ptr &session, const std::string &configured_display) {
       if (!session->valid || curtain || !observing_display_changes || !CGPreflightScreenCaptureAccess()) {
         return false;
@@ -122,6 +148,7 @@ namespace aurora_privacy {
       curtain = window;
       curtain_generation = session->generation;
       curtain_session = session;
+      load_curtain_artwork(session->generation);
       return true;
     }
 

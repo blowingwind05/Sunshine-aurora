@@ -115,14 +115,21 @@ namespace platf {
     return std::make_unique<deinit_t>();
   }
 
-  fs::path appdata() {
 #ifdef AURORA_SUNSHINE_HOST
+  /** @brief Return the managed profile cached before the bootstrap clears the environment. */
+  const fs::path &aurora_profile() {
     static const auto profile = [] {
       const auto *value = getenv("AURORA_SUNSHINE_PROFILE");
       const auto path = value ? fs::path {value} : fs::path {};
       return path.is_absolute() ? path : fs::path {};
     }();
     return profile;
+  }
+#endif
+
+  fs::path appdata() {
+#ifdef AURORA_SUNSHINE_HOST
+    return aurora_profile();
 #else
     const char *homedir;
     if ((homedir = getenv("HOME")) == nullptr) {
