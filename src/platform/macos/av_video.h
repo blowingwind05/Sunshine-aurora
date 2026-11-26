@@ -47,6 +47,9 @@ struct CaptureSession {
  */
 typedef bool (^FrameCallbackBlock)(CMSampleBufferRef);
 
+/** @brief Listener for a persistent capture output owned by AVVideo. */
+typedef void (^FrameSinkBlock)(CMSampleBufferRef);
+
 /**
  * @brief Capture session that owns the active AVFoundation inputs and outputs.
  */
@@ -91,5 +94,8 @@ typedef bool (^FrameCallbackBlock)(CMSampleBufferRef);
  * @return Capture status reported to the streaming pipeline.
  */
 - (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback;
+
+/** @brief Attach a persistent sample output. The sink must not call back into AVVideo. */
+- (BOOL)startBufferedCapture:(FrameSinkBlock)sink;
 
 @end

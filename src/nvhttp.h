@@ -29,6 +29,10 @@
  * @brief Contains all the functions and variables related to the nvhttp (GameStream) server.
  */
 namespace nvhttp {
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  /** @brief Revalidate the session owner's exact paired certificate, including expiry and revocation. */
+  [[nodiscard]] bool aurora_session_display_client_authorized(std::string_view cert);
+#endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   [[nodiscard]] bool aurora_screensaver_client_authorized(std::string_view cert);
 #endif

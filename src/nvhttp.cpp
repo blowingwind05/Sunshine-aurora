@@ -2251,6 +2251,85 @@ namespace nvhttp {
   }
 #endif
 
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  bool aurora_session_display_client_authorized(std::string_view cert) {
+    auto certificate = crypto::x509(cert);
+    if (!certificate) return false;
+    const std::lock_guard lock {client_auth_mutex()};
+    return verify_client_certificate(certificate.get()) == nullptr;
+  }
+
+  /** @brief Return the version-one display command result with typed JSON fields. */
+  void aurora_display_response(const resp_https_t &response, const aurora::session_display::result &result) {
+    using SimpleWeb::StatusCode;
+    using aurora::session_display::status;
+    auto code = StatusCode::success_ok;
+    auto label = "ok"sv;
+    switch (result.state) {
+      case status::ok: break;
+      case status::pending: code = StatusCode::success_accepted; label = "pending"; break;
+      case status::unsupported: code = StatusCode::client_error_not_found; label = "unsupported"; break;
+      case status::not_found: code = StatusCode::client_error_not_found; label = "not-found"; break;
+      case status::denied: code = StatusCode::client_error_forbidden; label = "denied"; break;
+      case status::invalid_request: code = StatusCode::client_error_bad_request; label = "invalid-request"; break;
+      case status::not_ready: code = StatusCode::client_error_conflict; label = "not-ready"; break;
+      case status::busy: code = StatusCode::client_error_conflict; label = "busy"; break;
+      case status::in_use: code = StatusCode::client_error_conflict; label = "in-use"; break;
+      case status::capacity: code = StatusCode::client_error_conflict; label = "capacity"; break;
+      case status::unavailable: code = StatusCode::server_error_service_unavailable; label = "unavailable"; break;
+      case status::cleanup_unconfirmed: code = StatusCode::server_error_service_unavailable; label = "cleanup-unconfirmed"; break;
+      case status::mode_unavailable: code = StatusCode::client_error_conflict; label = "mode-unavailable"; break;
+      case status::switch_unavailable: code = StatusCode::client_error_conflict; label = "switch-unavailable"; break;
+    }
+    nlohmann::json body {
+      {"status", label},
+      {"activeDisplayId", result.active ? nlohmann::json(result.active) : nlohmann::json(nullptr)},
+      {"canCreate", result.can_create},
+      {"canSelect", result.can_select},
+      {"displays", nlohmann::json::array()}
+    };
+    if (result.pending) body["pendingDisplayId"] = result.pending;
+    if (result.failed) body["failedDisplayId"] = result.failed;
+    if (result.affected) body["displayId"] = result.affected;
+    for (const auto &target : result.displays) {
+      body["displays"].push_back({
+        {"id", target.id}, {"name", target.name}, {"kind", target.owned_virtual ? "virtual" : "physical"},
+        {"ready", target.ready}, {"removable", target.removable},
+        {"width", target.width}, {"height", target.height}, {"refreshRate", target.refresh_rate}
+      });
+    }
+    response->write(code, body.dump(), {
+      {"Content-Type", "application/json"}, {"Cache-Control", "private, no-store"}, {"Connection", "close"}
+    });
+    response->close_connection_after_response = true;
+  }
+
+  /** @brief Handle the same exact-display command wire contract for every paired client OS. */
+  void aurora_session_displays(https_server_t &server, resp_https_t response, req_https_t request) {
+    namespace displays = aurora::session_display;
+    const auto identity = aurora_verified_peer(server, *request);
+    if (!identity) {
+      aurora_display_response(response, displays::result {displays::status::denied});
+      return;
+    }
+    const auto command = request->content.size() == 0 ? displays::parse(request->query_string) : std::nullopt;
+    if (!command) {
+      aurora_display_response(response, displays::result {displays::status::invalid_request});
+      return;
+    }
+    auto certificate = crypto::x509(identity->first);
+    if (!certificate) {
+      aurora_display_response(response, displays::result {displays::status::denied});
+      return;
+    }
+    auto result = rtsp_stream::aurora_session_displays(identity->first, *command, [&] {
+      const std::lock_guard lock {client_auth_mutex()};
+      return verify_client_certificate(certificate.get()) == nullptr;
+    });
+    aurora_display_response(response, result);
+  }
+#endif
+
   void start() {
     platf::set_thread_name("nvhttp");
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
@@ -2358,6 +2437,11 @@ namespace nvhttp {
     });
     https_server.resource["^/applist$"]["GET"] = authorized(applist);
     https_server.resource["^/appasset$"]["GET"] = authorized(appasset);
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    https_server.resource["^/aurora-session-displays$"]["POST"] = [&https_server](resp_https_t response, req_https_t request) {
+      aurora_session_displays(https_server, response, request);
+    };
+#endif
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || defined(__APPLE__))
     const auto appearance = [&https_server](resp_https_t response, req_https_t request) {
       aurora_privacy_appearance(https_server, response, request);

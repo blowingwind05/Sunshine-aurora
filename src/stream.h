@@ -14,6 +14,9 @@
 #include "audio.h"
 #include "crypto.h"
 #include "video.h"
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  #include "aurora_session_displays.h"
+#endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   #include "aurora_video_bitrate.h"
 #endif
@@ -100,6 +103,20 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    /** @brief Capture/input handle valid for the lifetime of this exact stream. */
+    aurora::session_display::capture_target &aurora_display_capture(session_t &session);
+
+    /** @brief Apply an authorized display command under the RTSP registry lock. */
+    aurora::session_display::result aurora_display_command(session_t &session,
+      const aurora::session_display::command &request, const std::function<bool()> &authorized);
+
+    /** @brief Whether the stream's display leases or capture override require exclusive admission. */
+    bool aurora_display_exclusive(const session_t &session);
+
+    /** @brief Whether the active Aurora display disappeared or a capture switch timed out. */
+    bool aurora_display_failed(const session_t &session);
+#endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
     /** @brief Return the bitrate controller for a live, encrypted, video-producing session. */
     aurora::video_bitrate::control_t *live_bitrate(session_t &session);

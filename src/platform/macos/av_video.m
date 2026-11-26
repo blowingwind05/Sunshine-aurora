@@ -15,7 +15,39 @@ static BOOL excludeScreenCursor(AVCaptureScreenInput *input) {
   return ![input capturesCursor];
 }
 
-@implementation AVVideo
+/** @brief AVFoundation delegate for persistent, non-blocking frame delivery. */
+@interface AVBufferedSampleSink: NSObject <AVCaptureVideoDataOutputSampleBufferDelegate> {
+  FrameSinkBlock _sink;  ///< Copied callback, released after the output queue drains.
+}
+- (instancetype)initWithSink:(FrameSinkBlock)sink;
+@end
+
+@implementation AVBufferedSampleSink
+
+- (instancetype)initWithSink:(FrameSinkBlock)sink {
+  if ((self = [super init])) {
+    _sink = [sink copy];
+  }
+  return self;
+}
+
+- (void)dealloc {
+  [_sink release];
+  [super dealloc];
+}
+
+- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sample
+        fromConnection:(AVCaptureConnection *)connection {
+  _sink(sample);
+}
+
+@end
+
+@implementation AVVideo {
+  AVCaptureVideoDataOutput *_bufferedOutput;  ///< Persistent output for exact-display capture.
+  AVBufferedSampleSink *_bufferedSink;  ///< Retained delegate for the persistent output.
+  dispatch_queue_t _bufferedQueue;  ///< Serial delegate queue, drained before releasing the sink.
+}
 
 + (BOOL)canExcludeCursorForDisplay:(CGDirectDisplayID)displayID {
   AVCaptureScreenInput *input = [[AVCaptureScreenInput alloc] initWithDisplayID:displayID];
@@ -46,7 +78,7 @@ static BOOL excludeScreenCursor(AVCaptureScreenInput *input) {
   CFRelease(mode);
 
   AVCaptureScreenInput *screenInput = [[AVCaptureScreenInput alloc] initWithDisplayID:self.displayID];
-  if (excludeCursor && !excludeScreenCursor(screenInput)) {
+  if (!screenInput || (excludeCursor && !excludeScreenCursor(screenInput))) {
     [screenInput release];
     [self release];
     return nil;
@@ -57,8 +89,10 @@ static BOOL excludeScreenCursor(AVCaptureScreenInput *input) {
     [self.session addInput:screenInput];
   } else {
     [screenInput release];
+    [self release];
     return nil;
   }
+  [screenInput release];
 
   [self.session startRunning];
 
@@ -66,10 +100,20 @@ static BOOL excludeScreenCursor(AVCaptureScreenInput *input) {
 }
 
 - (void)dealloc {
+  if (_bufferedOutput) {
+    [_bufferedOutput setSampleBufferDelegate:nil queue:NULL];
+  }
+  [self.session stopRunning];
+  if (_bufferedQueue) {
+    dispatch_sync(_bufferedQueue, ^{});
+    dispatch_release(_bufferedQueue);
+  }
+  [_bufferedOutput release];
+  [_bufferedSink release];
   [self.videoOutputs release];
   [self.captureCallbacks release];
   [self.captureSignals release];
-  [self.session stopRunning];
+  [self.session release];
   [super dealloc];
 }
 
@@ -78,16 +122,43 @@ static BOOL excludeScreenCursor(AVCaptureScreenInput *input) {
   self.frameHeight = frameHeight;
 }
 
-- (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback {
-  @synchronized(self) {
-    AVCaptureVideoDataOutput *videoOutput = [[AVCaptureVideoDataOutput alloc] init];
-
-    [videoOutput setVideoSettings:@{
+/** @brief Build an uncompressed AVFoundation output with the selected size and pixel format. */
+- (NSDictionary *)outputSettings {
+  return @{
       (NSString *) kCVPixelBufferPixelFormatTypeKey: [NSNumber numberWithUnsignedInt:self.pixelFormat],
       (NSString *) kCVPixelBufferWidthKey: [NSNumber numberWithInt:self.frameWidth],
       (NSString *) kCVPixelBufferHeightKey: [NSNumber numberWithInt:self.frameHeight],
       (NSString *) AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,
-    }];
+  };
+}
+
+- (BOOL)startBufferedCapture:(FrameSinkBlock)sink {
+  if (_bufferedOutput || !sink) {
+    return NO;
+  }
+  @try {
+    _bufferedOutput = [[AVCaptureVideoDataOutput alloc] init];
+    _bufferedSink = [[AVBufferedSampleSink alloc] initWithSink:sink];
+    _bufferedQueue = dispatch_queue_create("aurora.exact-display.capture", DISPATCH_QUEUE_SERIAL);
+    _bufferedOutput.alwaysDiscardsLateVideoFrames = YES;
+    [_bufferedOutput setVideoSettings:[self outputSettings]];
+    [_bufferedOutput setSampleBufferDelegate:_bufferedSink queue:_bufferedQueue];
+    [self.session stopRunning];
+    if (![self.session canAddOutput:_bufferedOutput]) {
+      return NO;
+    }
+    [self.session addOutput:_bufferedOutput];
+    [self.session startRunning];
+    return self.session.isRunning;
+  } @catch (NSException *) {
+    return NO;
+  }
+}
+
+- (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback {
+  @synchronized(self) {
+    AVCaptureVideoDataOutput *videoOutput = [[AVCaptureVideoDataOutput alloc] init];
+    [videoOutput setVideoSettings:[self outputSettings]];
 
     dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, DISPATCH_QUEUE_PRIORITY_HIGH);
     dispatch_queue_t recordingQueue = dispatch_queue_create("videoCaptureQueue", qos);

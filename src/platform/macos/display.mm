@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <optional>
 #include <string_view>
+#include <utility>
 
 // local includes
 #include "src/config.h"
@@ -19,6 +22,11 @@
 #include "src/platform/macos/av_video.h"
 #include "src/platform/macos/misc.h"
 #include "src/platform/macos/nv12_zero_device.h"
+#ifdef AURORA_SUNSHINE_HOST
+  #include "src/platform/macos/aurora_capture_geometry.h"
+  #include "src/platform/macos/aurora_capture_target.h"
+  #include "src/platform/macos/aurora_virtual_monitor.h"
+#endif
 #ifdef AURORA_MACOS_PRIVACY_PREVIEW
   #include "src/platform/macos/aurora_privacy.h"
 #endif
@@ -57,6 +65,161 @@ namespace platf {
       return colorspace.bit_depth == 10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     }
   }  // namespace
+
+#ifdef AURORA_SUNSHINE_HOST
+  namespace {
+    constexpr auto exact_capture_name = "aurora:exact-display"sv;  ///< Capture entry distinct from the encoder probe name.
+
+    /** @brief One immutable target revision plus its guarded capture readiness. */
+    struct exact_target_t {
+      CGDirectDisplayID id;
+      mac_capture::geometry_t geometry;
+      bool ready = false;
+      bool failed = false;
+      bool input_enabled = false;
+    };
+
+    std::mutex exact_mutex;  ///< Protects the exclusive selection and readiness.
+    const aurora_capture_target_t *exact_owner = nullptr;  ///< Session guard that owns the pin.
+    std::shared_ptr<exact_target_t> exact_target;  ///< Never cleared implicitly on capture failure.
+
+    /** @brief Read the actual active display geometry without a primary-display fallback. */
+    std::optional<mac_capture::geometry_t> exact_geometry(CGDirectDisplayID id) {
+      if (!id || !CGDisplayIsOnline(id) || !CGDisplayIsActive(id) ||
+          CGDisplayIsAsleep(id) || CGDisplayIsInMirrorSet(id) || CGDisplayIsBuiltin(id)) {
+        return std::nullopt;
+      }
+      const auto mode = CGDisplayCopyDisplayMode(id);
+      if (!mode) {
+        return std::nullopt;
+      }
+      const auto width = CGDisplayModeGetPixelWidth(mode);
+      const auto height = CGDisplayModeGetPixelHeight(mode);
+      CGDisplayModeRelease(mode);
+      const auto bounds = CGDisplayBounds(id);
+      return mac_capture::make_geometry(bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height, width, height);
+    }
+
+    /** @brief Verify the requested ID against the Host-owned virtual monitor registry. */
+    std::shared_ptr<exact_target_t> prepare_exact_target(CGDirectDisplayID id) {
+      if (!id || config::aurora_privacy_screensaver || !is_screen_capture_allowed()) {
+        return {};
+      }
+      const auto owned = display_device::aurora_virtual_monitor_t::enumerate_owned();
+      if (!owned || std::none_of(owned->begin(), owned->end(), [id](const auto &display) { return display.id == id; })) {
+        return {};
+      }
+      const auto geometry = exact_geometry(id);
+      return geometry ? std::make_shared<exact_target_t>(exact_target_t {id, *geometry}) : nullptr;
+    }
+
+    /** @brief Read the current pinned revision for enumeration or capture open. */
+    std::shared_ptr<exact_target_t> current_exact_target() {
+      std::lock_guard lock {exact_mutex};
+      return exact_target;
+    }
+
+    /** @brief Require the same active display, logical bounds and source mode. */
+    bool target_geometry_matches(const exact_target_t &target) {
+      const auto current = exact_geometry(target.id);
+      return current && mac_capture::same_geometry(*current, target.geometry);
+    }
+
+    /** @brief Mark the old revision unavailable without touching a newer selection. */
+    void mark_exact_failed(const std::shared_ptr<exact_target_t> &target) {
+      std::lock_guard lock {exact_mutex};
+      target->failed = true;
+      target->ready = false;
+      target->input_enabled = false;
+    }
+  }
+
+  std::unique_ptr<aurora_capture_target_t> aurora_select_capture_target(CGDirectDisplayID id) {
+    auto requested = prepare_exact_target(id);
+    if (!requested) {
+      return {};
+    }
+    std::unique_ptr<aurora_capture_target_t> guard {new aurora_capture_target_t};
+    std::lock_guard lock {exact_mutex};
+    if (exact_owner) {
+      return {};
+    }
+    exact_owner = guard.get();
+    exact_target = std::move(requested);
+    return guard;
+  }
+
+  bool aurora_capture_target_t::switch_to(CGDirectDisplayID id) {
+    auto requested = prepare_exact_target(id);
+    if (!requested) {
+      return false;
+    }
+    std::lock_guard lock {exact_mutex};
+    if (exact_owner != this) {
+      return false;
+    }
+    exact_target = std::move(requested);
+    return true;
+  }
+
+  bool aurora_capture_target_t::enable_absolute_input(CGDirectDisplayID id) {
+    std::lock_guard lock {exact_mutex};
+    if (exact_owner != this || exact_target->id != id || !exact_target->ready ||
+        exact_target->failed || !target_geometry_matches(*exact_target) || !CGPreflightPostEventAccess()) {
+      return false;
+    }
+    exact_target->input_enabled = true;
+    return true;
+  }
+
+  void aurora_capture_target_t::disable_absolute_input() {
+    std::lock_guard lock {exact_mutex};
+    if (exact_owner == this) {
+      exact_target->input_enabled = false;
+    }
+  }
+
+  aurora_capture_target_t::~aurora_capture_target_t() {
+    std::lock_guard lock {exact_mutex};
+    if (exact_owner == this) {
+      exact_target.reset();
+      exact_owner = nullptr;
+    }
+  }
+
+  bool aurora_capture_target_active() {
+    return static_cast<bool>(current_exact_target());
+  }
+
+  CGDirectDisplayID aurora_capture_target_ready() {
+    std::lock_guard lock {exact_mutex};
+    return exact_target && exact_target->ready && !exact_target->failed && target_geometry_matches(*exact_target) ?
+             exact_target->id : kCGNullDirectDisplay;
+  }
+
+  bool aurora_capture_absolute_mouse(const touch_port_t &port, float x, float y) {
+    std::lock_guard lock {exact_mutex};
+    if (!exact_target) {
+      return false;
+    }
+    if (!exact_target->input_enabled || !exact_target->ready || exact_target->failed || !target_geometry_matches(*exact_target)) {
+      return true;
+    }
+    const auto point = mac_capture::absolute_point(exact_target->geometry, port.offset_x, port.offset_y,
+                                                   port.logical_width, port.logical_height, x, y);
+    if (point && CGPreflightPostEventAccess()) {
+      const auto location = CGPointMake(point->x, point->y);
+      if (const auto event = CGEventCreateMouseEvent(nullptr, kCGEventMouseMoved, location, kCGMouseButtonLeft)) {
+        const auto local = CGPointMake(point->x - exact_target->geometry.x, point->y - exact_target->geometry.y);
+        if (CGDisplayMoveCursorToPoint(exact_target->id, local) == kCGErrorSuccess) {
+          CGEventPost(kCGHIDEventTap, event);
+        }
+        CFRelease(event);
+      }
+    }
+    return true;
+  }
+#endif
 
   /**
    * @brief macOS display capture source and image buffers.
@@ -218,6 +381,199 @@ namespace platf {
     }
   };
 
+#ifdef AURORA_SUNSHINE_HOST
+  namespace {
+    /** @brief Latest sample from an AVFoundation delegate with a bounded consumer wait. */
+    struct exact_samples_t {
+      std::mutex mutex;
+      std::condition_variable changed;
+      std::shared_ptr<av_sample_buf_t> latest;
+
+      void put(CMSampleBufferRef sample) {
+        if (!sample || !CMSampleBufferIsValid(sample) || !CMSampleBufferDataIsReady(sample) ||
+            !CMSampleBufferGetImageBuffer(sample)) {
+          return;
+        }
+        {
+          std::lock_guard lock {mutex};
+          latest = std::make_shared<av_sample_buf_t>(sample);
+        }
+        changed.notify_one();
+      }
+
+      std::shared_ptr<av_sample_buf_t> take() {
+        std::unique_lock lock {mutex};
+        changed.wait_for(lock, 50ms, [&] { return static_cast<bool>(latest); });
+        return std::exchange(latest, nullptr);
+      }
+    };
+
+    /** @brief VideoToolbox capture bound to one exact Mac display selection. */
+    struct exact_av_display_t: av_display_t {
+      std::shared_ptr<exact_target_t> target;
+      std::shared_ptr<exact_samples_t> samples = std::make_shared<exact_samples_t>();
+      std::shared_ptr<av_sample_buf_t> first_frame;
+      OSType format {};
+      int output_width {}, output_height {};
+
+      explicit exact_av_display_t(std::shared_ptr<exact_target_t> requested):
+          target {std::move(requested)} {}
+
+      ~exact_av_display_t() override {
+        std::lock_guard lock {exact_mutex};
+        target->ready = false;
+        target->input_enabled = false;
+      }
+
+      /** @brief Report intentional retargeting separately from failure or guard teardown. */
+      capture_e status() const {
+        std::lock_guard lock {exact_mutex};
+        if (exact_target != target) {
+          return exact_target ? capture_e::reinit : capture_e::error;
+        }
+        if (target->failed || !target_geometry_matches(*target)) {
+          target->ready = false;
+          target->failed = true;
+          return capture_e::error;
+        }
+        return capture_e::ok;
+      }
+
+      /** @brief Verify this sample matches the selected AVCapture output. */
+      bool valid_frame(const std::shared_ptr<av_sample_buf_t> &sample) const {
+        const auto image = sample ? CMSampleBufferGetImageBuffer(sample->buf) : nullptr;
+        return image && CVPixelBufferGetWidth(image) == static_cast<size_t>(output_width) &&
+               CVPixelBufferGetHeight(image) == static_cast<size_t>(output_height) &&
+               CVPixelBufferGetPixelFormatType(image) == format;
+      }
+
+      /** @brief Bind AVCapture and wait for a real, matching first frame before publication. */
+      bool open(const video::config_t &config) {
+        if (status() != capture_e::ok || config.framerate <= 0 ||
+            !mac_capture::compatible_output(target->geometry, config.width, config.height)) {
+          return false;
+        }
+        const auto &geometry = target->geometry;
+        display_id = target->id;
+        offset_x = geometry.x;
+        offset_y = geometry.y;
+        width = env_width = geometry.pixel_width;
+        height = env_height = geometry.pixel_height;
+        logical_width = env_logical_width = geometry.width;
+        logical_height = env_logical_height = geometry.height;
+        output_width = config.width;
+        output_height = config.height;
+        format = videotoolbox_pixel_format(config);
+        display_power_guard = display_device::keep_display_awake("Aurora exact display capture");
+
+        @autoreleasepool {
+          @try {
+            av_capture = [[AVVideo alloc] initWithDisplay:display_id frameRate:config.framerate excludeCursor:config.aurora_client_cursor];
+            if (!av_capture) {
+              return false;
+            }
+            [av_capture setFrameWidth:output_width frameHeight:output_height];
+            av_capture.pixelFormat = format;
+            const auto inbox = samples;
+            if (![av_capture startBufferedCapture:^(CMSampleBufferRef sample) { inbox->put(sample); }]) {
+              return false;
+            }
+          } @catch (NSException *) {
+            return false;
+          }
+        }
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (std::chrono::steady_clock::now() < deadline && status() == capture_e::ok) {
+          if (auto sample = samples->take()) {
+            if (!valid_frame(sample)) {
+              return false;
+            }
+            std::lock_guard lock {exact_mutex};
+            if (exact_target != target || target->failed || !target_geometry_matches(*target)) {
+              return false;
+            }
+            first_frame = std::move(sample);
+            target->ready = true;
+            return true;
+          }
+        }
+        return false;
+      }
+
+      /** @brief Transfer one verified CoreVideo image into Sunshine's encoder buffer. */
+      void use_frame(std::shared_ptr<av_sample_buf_t> sample, img_t &image) const {
+        auto &out = static_cast<av_img_t &>(image);
+        auto pixel = std::make_shared<av_pixel_buf_t>(sample->buf);
+        out.pixel_buffer.reset();
+        out.sample_buffer = std::move(sample);
+        out.pixel_buffer = std::move(pixel);
+        out.data = out.pixel_buffer->data();
+        out.width = output_width;
+        out.height = output_height;
+        out.row_pitch = static_cast<int>(CVPixelBufferGetBytesPerRowOfPlane(out.pixel_buffer->buf, 0));
+        out.pixel_pitch = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ? 2 : 1;
+      }
+
+      int dummy_img(img_t *image) override {
+        if (status() != capture_e::ok || !first_frame) {
+          return -1;
+        }
+        use_frame(first_frame, *image);
+        return 0;
+      }
+
+      std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e pix_fmt) override {
+        const auto required = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ? pix_fmt_e::p010 : pix_fmt_e::nv12;
+        if (pix_fmt != required) {
+          return nullptr;
+        }
+        auto device = std::make_unique<nv12_zero_device>();
+        device->init(this, pix_fmt, [](void *, int, int) {}, [](void *, int) {});
+        return device;
+      }
+
+      capture_e capture(const push_captured_image_cb_t &push, const pull_free_image_cb_t &pull, bool *) override {
+        auto stop = util::fail_guard([&] { mark_exact_failed(target); });
+        auto sample = first_frame;
+        auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (true) {
+          const auto current = status();
+          if (current != capture_e::ok) {
+            return current;
+          }
+          if (!sample) {
+            sample = samples->take();
+            if (!sample) {
+              if (std::chrono::steady_clock::now() >= deadline) {
+                return capture_e::error;
+              }
+              continue;
+            }
+          }
+          if (!valid_frame(sample)) {
+            return capture_e::error;
+          }
+          std::shared_ptr<img_t> image;
+          if (!pull(image)) {
+            return capture_e::ok;
+          }
+          const auto before_push = status();
+          if (before_push != capture_e::ok) {
+            return before_push;
+          }
+          use_frame(std::move(sample), *image);
+          deadline = std::chrono::steady_clock::now() + 5s;
+          if (!push(std::move(image), true)) {
+            // The existing switch mailbox may have asked for a rebuild of this revision.
+            stop.disable();
+            return capture_e::ok;
+          }
+        }
+      }
+    };
+  }
+#endif
+
 #ifdef AURORA_MACOS_PRIVACY_PREVIEW
   struct privacy_display_t: public display_t {
     aurora_privacy::session_ptr privacy;
@@ -298,6 +654,9 @@ namespace platf {
     }
   #endif
     @autoreleasepool {
+      if (const auto pinned = current_exact_target()) {
+        return target_geometry_matches(*pinned) && [AVVideo canExcludeCursorForDisplay:pinned->id];
+      }
       return [AVVideo canExcludeCursorForDisplay:parse_display_id(display_name).value_or(CGMainDisplayID())];
     }
   }
@@ -308,6 +667,26 @@ namespace platf {
       BOOST_LOG(error) << "Could not initialize display with the given hw device type."sv;
       return nullptr;
     }
+
+#ifdef AURORA_SUNSHINE_HOST
+    if (display_name == exact_capture_name) {
+      const auto pinned = current_exact_target();
+      if (!pinned) {
+        return nullptr;
+      }
+      if (config::aurora_privacy_screensaver || hwdevice_type != mem_type_e::videotoolbox) {
+        mark_exact_failed(pinned);
+        return nullptr;
+      }
+      auto exact = std::make_shared<exact_av_display_t>(pinned);
+      if (!exact->open(config)) {
+        mark_exact_failed(pinned);
+        BOOST_LOG(warning) << "Aurora exact display did not yield a matching capture frame for CGDirectDisplayID " << pinned->id;
+        return nullptr;
+      }
+      return exact;
+    }
+#endif
 
 #ifdef AURORA_MACOS_PRIVACY_PREVIEW
     if (auto privacy = aurora_privacy::current()) {
@@ -402,6 +781,14 @@ namespace platf {
       return display_names;
     }
 
+#ifdef AURORA_SUNSHINE_HOST
+    if (current_exact_target()) {
+      // refresh_displays feeds this entry to display(), distinct from the legacy encoder probe name.
+      // Keep the entry if the exact ID disappears so reinit cannot fall back.
+      return {std::string {exact_capture_name}};
+    }
+#endif
+
     const auto devices {display_device::enumerate_devices()};
     display_names.reserve(devices.size());
     for (const auto &device : devices) {
@@ -415,6 +802,17 @@ namespace platf {
 
 #ifdef AURORA_SUNSHINE_HOST
   std::optional<std::pair<std::size_t, std::size_t>> aurora_capture_size() {
+    {
+      std::lock_guard lock {exact_mutex};
+      if (exact_target) {
+        if (!exact_target->ready || exact_target->failed || !target_geometry_matches(*exact_target)) {
+          return std::nullopt;
+        }
+        return std::pair {static_cast<std::size_t>(exact_target->geometry.pixel_width),
+                          static_cast<std::size_t>(exact_target->geometry.pixel_height)};
+      }
+    }
+
     // Match video::refresh_displays when starting a new capture. An explicitly
     // configured output may be woken later, so omit geometry while it is unknown.
     const auto outputs = display_names(mem_type_e::videotoolbox);

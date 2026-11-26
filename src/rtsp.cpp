@@ -732,7 +732,7 @@ namespace rtsp_stream {
     }
 
     /** @brief Result of admitting a stream to the shared capture. */
-    enum class insert_result { accepted, privacy_conflict, cursor_conflict };
+    enum class insert_result { accepted, privacy_conflict, cursor_conflict, display_conflict };
 
     /**
      * @brief Inserts the provided session into the set of sessions.
@@ -746,6 +746,10 @@ namespace rtsp_stream {
       if (std::ranges::any_of(*_session_slots, [](const auto &slot) {
             return stream::session::aurora_privacy_owned(*slot) || stream::session::aurora_displays_owned(*slot);
           })) return insert_result::privacy_conflict;
+#elif defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+      if (std::ranges::any_of(*_session_slots, [](const auto &slot) {
+            return stream::session::aurora_display_exclusive(*slot);
+          })) return insert_result::display_conflict;
 #endif
       if (!aurora::client_cursor::compatible(!_session_slots->empty(), _active_excludes_cursor, excludes_cursor)) {
         return insert_result::cursor_conflict;
@@ -756,6 +760,36 @@ namespace rtsp_stream {
       BOOST_LOG(info) << "New streaming session started [active sessions: "sv << _session_slots->size() << ']';
       return insert_result::accepted;
     }
+
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    /** @brief Hold topology ownership across commands and prevent new shared-capture admission. */
+    aurora::session_display::result session_displays(std::string_view cert,
+      const aurora::session_display::command &request, const std::function<bool()> &authorize) {
+      using namespace stream::session;
+      auto lock = _session_slots.lock();
+      if (cert.empty() || _session_slots->size() != 1) {
+        return aurora::session_display::result {aurora::session_display::status::denied};
+      }
+      auto &slot = **_session_slots->begin();
+      if (client_cert(slot) != cert) return aurora::session_display::result {aurora::session_display::status::denied};
+      return aurora_display_command(slot, request, [&] {
+        return state(slot) == state_e::RUNNING && authorize();
+      });
+    }
+
+    /** @brief Stop a controlled capture if its active lease or certificate authorization disappears. */
+    void check_live_displays() {
+      using namespace stream::session;
+      auto lock = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (state(*slot) != state_e::RUNNING || !aurora_display_exclusive(*slot)) continue;
+        if (aurora_display_failed(*slot) || !nvhttp::aurora_session_display_client_authorized(client_cert(*slot))) {
+          BOOST_LOG(warning) << "Aurora session display lost its target, switch confirmation or authorization; ending its stream";
+          stream::session::stop(*slot);
+        }
+      }
+    }
+#endif
 
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || (defined(__APPLE__) && defined(AURORA_MACOS_PRIVACY_PREVIEW)))
     /** @brief Serialize the appearance operation with session admission and removal. */
@@ -859,6 +893,13 @@ namespace rtsp_stream {
       // 500ms to allow session cleanup to happen.
       if (session_count() > 0) {
         io_context.run_one_for(500ms);
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+        const auto display_now = std::chrono::steady_clock::now();
+        if (display_now >= display_check_due) {
+          display_check_due = display_now + 250ms;
+          check_live_displays();
+        }
+#endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
         check_live_privacy();
         const auto now = std::chrono::steady_clock::now();
@@ -897,6 +938,9 @@ namespace rtsp_stream {
     tcp::acceptor acceptor {io_context};
     std::mutex _launch_mutex;  ///< Serializes publication and expiry of the pending launch ticket.
     boost::asio::steady_timer raised_timer {io_context};
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    std::chrono::steady_clock::time_point display_check_due {};  ///< Deadline for the next lease/authorization check.
+#endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
     std::chrono::steady_clock::time_point privacy_check_due {};
 #endif
@@ -905,6 +949,13 @@ namespace rtsp_stream {
   };
 
   rtsp_server_t server {};  ///< Singleton RTSP server used by GameStream launch sessions.
+
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  aurora::session_display::result aurora_session_displays(std::string_view cert,
+    const aurora::session_display::command &request, const std::function<bool()> &authorize) {
+    return server.session_displays(cert, request, authorize);
+  }
+#endif
 
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || (defined(__APPLE__) && defined(AURORA_MACOS_PRIVACY_PREVIEW)))
   bool aurora_with_privacy_appearance_owner(std::string_view cert, const std::function<void()> &operation) {
@@ -1525,6 +1576,9 @@ namespace rtsp_stream {
         return;
       case rtsp_server_t::insert_result::cursor_conflict:
         respond(sock, session, &option, 503, "ANOTHER SESSION USES AN INCOMPATIBLE CURSOR MODE", req->sequenceNumber, {});
+        return;
+      case rtsp_server_t::insert_result::display_conflict:
+        respond(sock, session, &option, 503, "ANOTHER SESSION OWNS THE CAPTURE DISPLAY", req->sequenceNumber, {});
         return;
       case rtsp_server_t::insert_result::accepted:
         break;

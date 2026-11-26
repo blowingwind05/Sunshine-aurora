@@ -46,7 +46,13 @@ if(AURORA_SUNSHINE_HOST)
     find_library(AURORA_CORE_SERVICES CoreServices REQUIRED)
     find_library(AURORA_CORE_GRAPHICS CoreGraphics REQUIRED)
     set(aurora_virtual_monitor_source "${CMAKE_SOURCE_DIR}/src/platform/macos/aurora_virtual_monitor.mm")
-    target_sources(${sunshine_engine_target} PRIVATE "${aurora_virtual_monitor_source}")
+    set(aurora_session_display_sources
+        "${aurora_virtual_monitor_source}"
+        "${CMAKE_SOURCE_DIR}/src/aurora_session_displays.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/aurora_session_displays.cpp")
+    target_sources(${sunshine_engine_target} PRIVATE ${aurora_session_display_sources})
+    list(APPEND SUNSHINE_TARGET_FILES ${aurora_session_display_sources})
+    list(APPEND SUNSHINE_EXTERNAL_LIBRARIES ${AURORA_CORE_GRAPHICS})
     set_source_files_properties("${aurora_virtual_monitor_source}" PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-    target_link_libraries(${sunshine_engine_target} ${AURORA_CORE_SERVICES} ${AURORA_CORE_GRAPHICS})
+    target_link_libraries(${sunshine_engine_target} ${AURORA_CORE_SERVICES})
 endif()

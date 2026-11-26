@@ -12,11 +12,25 @@
 #include "aurora_client_cursor.h"
 #include "crypto.h"
 #include "thread_safe.h"
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  #include "aurora_session_displays.h"
+#endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   #include "aurora_video_bitrate.h"
 #endif
 
 namespace rtsp_stream {
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  /**
+   * @brief Dispatch an HTTPS command to the sole running session owned by the exact TLS certificate.
+   * @param cert Verified peer certificate in PEM form.
+   * @param request Parsed display command.
+   * @param authorize Live certificate authorization check for use under the session registry lock.
+   * @return Confirmed status or a rejection without topology from other sessions.
+   */
+  aurora::session_display::result aurora_session_displays(std::string_view cert,
+    const aurora::session_display::command &request, const std::function<bool()> &authorize);
+#endif
 #if defined(AURORA_SUNSHINE_HOST) && (defined(_WIN32) || (defined(__APPLE__) && defined(AURORA_MACOS_PRIVACY_PREVIEW)))
   /**
    * @brief Run the profile operation only while the matching certificate owns the sole running session.
