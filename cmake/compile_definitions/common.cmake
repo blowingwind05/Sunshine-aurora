@@ -217,6 +217,10 @@ if(NOT APPLE)
 endif()
 
 if(AURORA_SUNSHINE_HOST AND (WIN32 OR APPLE))
+    if(MINGW)
+        # Match the static zlib already used by the UCRT64 dependencies.
+        set(ZLIB_USE_STATIC_LIBS ON)
+    endif()
     find_package(ZLIB REQUIRED)
     list(APPEND SUNSHINE_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/aurora_privacy_appearance.h"
