@@ -32,6 +32,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "nvhttp.h"
 #include "platform/common.h"
 #include "process.h"
 #include "stream.h"
@@ -39,6 +40,9 @@ extern "C" {
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  #include "src/platform/macos/aurora_capture_target.h"
+#endif
 #ifdef AURORA_MACOS_PRIVACY_PREVIEW
   #include "src/platform/macos/aurora_privacy.h"
 #endif
@@ -501,6 +505,10 @@ namespace stream {
 
 #if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
     aurora::session_display::controller display_control;  ///< Leases and exact capture target for this stream only.
+    bool display_switch_opt_in = false;  ///< Negotiated presentation barrier and encrypted input transport.
+    bool reliable_mouse_packet = false;  ///< Set only during the synchronous ENet receive callback.
+    std::mutex display_guard_mutex;
+    std::unique_ptr<platf::aurora_capture_target_t> display_guard;  ///< Retained through worker drain.
 #endif
 
 #ifdef AURORA_MACOS_PRIVACY_PREVIEW
@@ -791,6 +799,11 @@ namespace stream {
             net::packet_t packet {event.packet};
             auto message = parse_control_packet(*packet);
             if (message) {
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+              session->reliable_mouse_packet = event.channelID == CTRL_CHANNEL_MOUSE &&
+                (packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0;
+              auto clear_mouse_transport = util::fail_guard([session] { session->reliable_mouse_packet = false; });
+#endif
               call(message->first, session, message->second, false);
             }
           }
@@ -1261,12 +1274,13 @@ namespace stream {
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_ENCRYPTED]"sv;
 
+      if (payload.size() < sizeof(control_encrypted_t) - sizeof(std::uint16_t)) return;
       auto header = (control_encrypted_p) (payload.data() - 2);
 
       auto length = util::endian::little(header->length);
       auto seq = util::endian::little(header->seq);
 
-      if (length < (16 + 4 + 4)) {
+      if (length < (16 + 4 + 4) || length != payload.size() - sizeof(header->length)) {
         BOOST_LOG(warning) << "Control: Runt packet"sv;
         return;
       }
@@ -1306,6 +1320,7 @@ namespace stream {
         return;
       }
 
+      if (plaintext.size() < 4) return;
       auto type = *(std::uint16_t *) plaintext.data();
       std::string_view next_payload {(char *) plaintext.data() + 4, plaintext.size() - 4};
 
@@ -1318,7 +1333,12 @@ namespace stream {
       // IDX_INPUT_DATA callback will attempt to decrypt unencrypted data, therefore we need pass it directly
       if (type == packetTypes[IDX_INPUT_DATA]) {
         plaintext.erase(std::begin(plaintext), std::begin(plaintext) + 4);
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+        input::passthrough(session->input, std::move(plaintext), session->display_switch_opt_in &&
+          session->reliable_mouse_packet && (session->config.encryptionFlagsEnabled & SS_ENC_CONTROL_V2));
+#else
         input::passthrough(session->input, std::move(plaintext));
+#endif
       } else {
         server->call(type, session, next_payload, true);
       }
@@ -1576,6 +1596,13 @@ namespace stream {
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+      const bool real_display_idr = packet->is_idr() && packet->real_display_sample && packet->data_size() != 0;
+      auto &display_capture = session->display_control.capture;
+      if (session->display_switch_opt_in &&
+          !display_capture.video_allowed(packet->source_display_id, packet->display_generation, real_display_idr)) continue;
+      bool display_frame_sent = true;
+#endif
       auto lowseq = session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
@@ -1827,7 +1854,11 @@ namespace stream {
                     session->localAddress,
                   };
 
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+                  display_frame_sent = platf::send(send_info) && display_frame_sent;
+#else
                   platf::send(send_info);
+#endif
                 }
               }
               frame_send_batch_latency_logger.second_point_now_and_log();
@@ -1861,10 +1892,15 @@ namespace stream {
           session->sent_video_frame.store(true, std::memory_order_release);
         }
 #elif defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
-        if (const auto source = packet->source_display_id) {
-          auto &capture = session->display_control.capture;
+        if (display_frame_sent && packet->display_generation) {
+          display_capture.video_sent(packet->source_display_id, packet->display_generation,
+            static_cast<std::uint32_t>(packet->frame_index()), real_display_idr);
+        } else if (!display_frame_sent && packet->display_generation && real_display_idr) {
+          session->video.idr_events->raise(true);
+        }
+        if (const auto source = display_frame_sent ? packet->source_display_id : 0) {
           const bool confirmed = packet->ordinary_display_source ?
-            capture.report_inventory_ready(source) : capture.report_initial(source);
+            display_capture.report_inventory_ready(source) : display_capture.report_initial(source);
           if (confirmed) {
             BOOST_LOG(debug) << "Aurora confirmed Mac capture source " << source;
           }
@@ -2240,12 +2276,59 @@ namespace stream {
       return session.display_control.capture;
     }
 
+    /** @brief Begin reinit on the ordered input worker after old input has been released. */
+    bool start_display_switch(session_t &session, const aurora::session_display::switch_request &request,
+      const std::shared_ptr<const aurora::session_display::lease> &lease) {
+      if (!nvhttp::aurora_session_display_client_authorized(session.client_cert)) return false;
+      const std::lock_guard lock {session.display_guard_mutex};
+      if (state(session) != state_e::RUNNING || !session.display_control.capture.begin(request)) return false;
+      std::function<bool(std::uint32_t)> owns;
+      if (lease) {
+        owns = [lease](std::uint32_t id) { return lease->id() == id && lease->ready(); };
+      }
+      if (session.display_guard) {
+        session.display_guard->disable_absolute_input();
+        if (!session.display_guard->switch_to(request.id, owns)) return false;
+      } else {
+        session.display_guard = platf::aurora_select_capture_target(request.id, owns);
+        if (!session.display_guard) return false;
+      }
+      mail::man->event<int>(mail::switch_display)->raise(0);
+      return true;
+    }
+
+    /** @brief Consume a presentation proof at its position in this session's reliable input queue. */
+    bool display_presented(session_t &session, std::uint32_t generation, std::uint32_t frame) {
+      if (state(session) != state_e::RUNNING || !nvhttp::aurora_session_display_client_authorized(session.client_cert)) return false;
+      const std::lock_guard lock {session.display_guard_mutex};
+      if (state(session) != state_e::RUNNING || !session.display_guard) return false;
+      return session.display_control.capture.presented(generation, frame, [&](auto id) {
+        return platf::aurora_capture_target_ready() == id && session.display_guard->enable_absolute_input(id);
+      });
+    }
+
     aurora::session_display::result aurora_display_command(session_t &session,
       const aurora::session_display::command &request, const std::function<bool()> &authorized) {
       namespace displays = aurora::session_display;
       if (!authorized()) return displays::result {displays::status::denied};
-      // A host-side capture acknowledgement alone cannot prove a new client-visible video generation.
-      return session.display_control.apply(request, displays::mac_backend(), authorized, false);
+      const auto &video = session.config.monitor;
+      auto reply = session.display_control.apply(request, displays::mac_backend(), authorized, session.display_switch_opt_in,
+        {static_cast<unsigned>(video.width), static_cast<unsigned>(video.height), 0});
+      if (request.action != displays::operation::select || reply.state != displays::status::pending) return reply;
+      const auto pending = session.display_control.capture.take_pending();
+      if (pending) {
+        const auto lease = session.display_control.lease_for(pending->id);
+        if (!input::enqueue_display_switch(session.input, pending->generation, [&session, pending, lease] {
+              if (!start_display_switch(session, *pending, lease)) stop(session);
+            }, [&session](std::uint32_t generation, std::uint32_t frame) {
+              return display_presented(session, generation, frame);
+            })) {
+          const bool current = authorized();
+          stop(session);
+          return displays::result {current ? displays::status::unavailable : displays::status::denied};
+        }
+      }
+      return reply;
     }
 
     bool aurora_display_exclusive(const session_t &session) {
@@ -2349,7 +2432,11 @@ namespace stream {
         session.video.bitrate->close();
       }
 #elif defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
-      session.display_control.capture.close();
+      {
+        const std::lock_guard lock {session.display_guard_mutex};
+        session.display_control.capture.close();
+        if (session.display_guard) session.display_guard->disable_absolute_input();
+      }
 #endif
       session.shutdown_event->raise(true);
     }
@@ -2382,6 +2469,16 @@ namespace stream {
       session.audioThread.join();
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+      if (session.display_switch_opt_in) {
+        std::promise<void> input_stopped;
+        const auto stopped = input_stopped.get_future();
+        input::enqueue_display_stop(session.input, [&] { input_stopped.set_value(); });
+        stopped.wait();
+        const std::lock_guard lock {session.display_guard_mutex};
+        session.display_guard.reset();
+      }
+#endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
       aurora_privacy_release(session);
       if (aurora_displays_owned(session)) std::ignore = display_device::aurora_restore_local_displays();
@@ -2439,7 +2536,7 @@ namespace stream {
   #ifdef AURORA_MACOS_PRIVACY_PREVIEW
         const auto &monitor = session.config.monitor;
         if (session.client_cert.empty() || monitor.dynamicRange || monitor.chromaSamplingType ||
-            !video::aurora_privacy_uses_videotoolbox()) {
+            !video::aurora_uses_videotoolbox()) {
           BOOST_LOG(error) << "Aurora privacy needs a paired client and an SDR 4:2:0 VideoToolbox stream"sv;
           return -1;
         }
@@ -2504,6 +2601,9 @@ namespace stream {
       if (launch_session.rtsp_cipher && !session->client_cert.empty() &&
           (config.encryptionFlagsEnabled & encryption) == encryption && !::config::aurora_privacy_screensaver) {
         session->display_control.capture.enable();
+        session->display_switch_opt_in = launch_session.aurora_display_switch && config.controlProtocolType == 13 &&
+          config.monitor.width > 0 && config.monitor.height > 0 && !config.monitor.dynamicRange &&
+          !config.monitor.chromaSamplingType && video::aurora_uses_videotoolbox();
       }
 #endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)

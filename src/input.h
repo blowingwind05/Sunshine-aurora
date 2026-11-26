@@ -20,6 +20,27 @@
 namespace input {
   struct input_t;
 
+  inline constexpr std::uint32_t AURORA_DISPLAY_BARRIER = 0x41554453;  ///< NV input magic for the displayed-frame barrier.
+  using display_barrier_validator_t = std::function<bool(std::uint32_t generation, std::uint32_t client_presented_frame)>;  ///< Control-layer proof, run on the ordered input worker.
+
+  /**
+   * @brief Queue an exclusive display transition on the same worker as pointer packets.
+   * @param input Active stream input state.
+   * @param generation Nonzero generation increasing within this stream.
+   * @param on_paused Called after the old buttons and touch port have been cleared.
+   * @param validate_barrier Validates the presented frame and arms the platform route before returning true.
+   * @return True when queued. No success callback is emitted for a stale or closed generation.
+   */
+  [[nodiscard]] bool enqueue_display_switch(const std::shared_ptr<input_t> &input, std::uint32_t generation,
+                                            std::function<void()> on_paused, display_barrier_validator_t validate_barrier);
+
+  /**
+   * @brief Close this input epoch and release held buttons before destroying the platform selection.
+   * @param input Active stream input state.
+   * @param on_stopped Optional completion callback on the input worker.
+   */
+  void enqueue_display_stop(const std::shared_ptr<input_t> &input, std::function<void()> on_stopped = {});
+
   /**
    * @brief Write a debug log representation of the input packet.
    *
@@ -49,9 +70,12 @@ namespace input {
   void terminate_gamepads(std::string_view session_id);
 
   /**
-   * @brief Queue a raw input message for platform passthrough.
+   * @brief Queue an authenticated, decrypted input message for platform passthrough.
+   * @param input Active stream input state.
+   * @param input_data Raw NV input message.
+   * @param reliable_mouse True only for authenticated reliable mouse-channel delivery.
    */
-  void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data);
+  void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data, bool reliable_mouse = false);
 
   /**
    * @brief Initialize global input resources and platform backends.
@@ -168,6 +192,15 @@ namespace input {
      * @return Number of queued packets, or zero for an empty input pointer.
      */
     std::size_t queued_input_packet_count(const std::shared_ptr<input_t> &input);
+
+    /** @brief Process one FIFO item in a fixture with the task pool stopped. */
+    void process_next_input(const std::shared_ptr<input_t> &input);
+
+    /** @brief Inspect the current pointer gate in a fixture without posting an OS event. */
+    bool allows_pointer_packet(const std::shared_ptr<input_t> &input, std::uint32_t magic, bool reliable_mouse);
+
+    /** @brief Simulate the result of delivering an absolute pointer position. */
+    void set_pointer_positioned(const std::shared_ptr<input_t> &input, bool delivered);
   }  // namespace testing
 #endif
 

@@ -672,6 +672,11 @@ namespace nvhttp {
 
   std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args, const paired_identity_t *identity) {
     auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    const auto [display_switch, display_end] = args.equal_range("auroraDisplaySwitch");
+    launch_session->aurora_display_switch = identity && !identity->first.empty() &&
+      display_switch != display_end && std::next(display_switch) == display_end && display_switch->second == "1"sv;
+#endif
 
     launch_session->id = ++session_id_counter;
 
@@ -2286,6 +2291,7 @@ namespace nvhttp {
       case status::cleanup_unconfirmed: code = StatusCode::server_error_service_unavailable; label = "cleanup-unconfirmed"; break;
       case status::mode_unavailable: code = StatusCode::client_error_conflict; label = "mode-unavailable"; break;
       case status::switch_unavailable: code = StatusCode::client_error_conflict; label = "switch-unavailable"; break;
+      case status::incompatible_aspect: code = StatusCode::client_error_conflict; label = "incompatible-aspect"; break;
     }
     nlohmann::json body {
       {"status", label},
@@ -2295,14 +2301,20 @@ namespace nvhttp {
       {"displays", nlohmann::json::array()}
     };
     if (result.pending) body["pendingDisplayId"] = result.pending;
+    if (result.generation) body["switchGeneration"] = result.generation;
+    if (result.first_frame) body["firstFrame"] = *result.first_frame;
     if (result.failed) body["failedDisplayId"] = result.failed;
     if (result.affected) body["displayId"] = result.affected;
     for (const auto &target : result.displays) {
-      body["displays"].push_back({
+      nlohmann::json display {
         {"id", target.id}, {"name", target.name}, {"kind", target.owned_virtual ? "virtual" : "physical"},
-        {"ready", target.ready}, {"removable", target.removable},
+        {"ready", target.ready}, {"removable", target.removable}, {"selectable", target.selectable},
         {"width", target.width}, {"height", target.height}, {"refreshRate", target.refresh_rate}
-      });
+      };
+      if (result.can_select && result.active && target.ready && !target.selectable && !result.pending) {
+        display["selectBlockReason"] = "incompatible-aspect";
+      }
+      body["displays"].push_back(std::move(display));
     }
     response->write(code, body.dump(), {
       {"Content-Type", "application/json"}, {"Cache-Control", "private, no-store"}, {"Connection", "close"}

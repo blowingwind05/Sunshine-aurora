@@ -101,6 +101,7 @@ int main() {
   constexpr command remove_virtual {remove, 100};
   constexpr command display_list {list};
   fake_backend driver;
+  driver.primary_mode = {2560, 1440, 60};
   controller session;
   bool paired = false;
   const auto authorized = [&] { return paired; };
@@ -125,31 +126,60 @@ int main() {
   driver.visible = true;
   created = run(create_1080);
   require(created.state == status::ok && created.affected == 100 && created.active == 10 && driver.creations == 1, "idempotent create has actual target");
-  require(!session.capture.confirm({1, 100}), "unsolicited capture acknowledgement");
+  const auto incompatible = session.apply(to_virtual, driver, authorized, true, {1920, 1200, 60});
+  const auto incompatible_target = std::ranges::find(incompatible.displays, 100, &display::id);
+  require(incompatible.state == status::incompatible_aspect && incompatible_target != incompatible.displays.end() &&
+    !incompatible_target->selectable && !session.capture.take_pending(), "different negotiated aspect is rejected before capture work");
+  driver.primary_mode = {3024, 1964, 60};
+  require(run(to_virtual).state == status::incompatible_aspect, "different observed source aspect is rejected");
+  driver.primary_mode = {2560, 1440, 60};
+  const auto enable_route = [](display_id) { return true; };
+  require(!session.capture.presented(1, 100, enable_route), "unsolicited presentation acknowledgement");
   auto selected = run(to_virtual);
   require(selected.state == status::pending && selected.active == 10 && selected.pending == 100, "no success before capture/input confirmation");
-  require(!session.capture.expired() && session.capture.expired(std::chrono::steady_clock::now() + std::chrono::seconds {9}),
+  require(!session.capture.expired() && session.capture.expired(std::chrono::steady_clock::now() + std::chrono::seconds {16}),
     "bounded wait for capture confirmation");
   require(run(to_virtual).state == status::pending, "repeat pending select");
   require(run(command {select, 20}).state == status::busy, "competing pending select");
   require(run(remove_virtual).state == status::in_use, "cannot remove pending capture");
   auto ticket = session.capture.take_pending();
   require(ticket.has_value() && !session.capture.take_pending(), "claim only once");
-  require(!session.capture.confirm({ticket->generation + 1, 100}), "reject stale acknowledgement");
-  require(!session.capture.confirm({ticket->generation, 20}), "reject wrong exact target");
-  require(session.capture.reject(*ticket), "old capture remained valid");
-  require(run(display_list).active == 10 && run(display_list).failed == 100, "report asynchronous failure");
-  require(run(to_virtual).state == status::pending, "intentional retry after failure");
-  const auto replacement = session.capture.take_pending();
-  require(replacement && !session.capture.confirm(*ticket) && session.capture.confirm(*replacement), "retry has a different generation");
+  require(session.capture.begin(*ticket), "capture waits for ordered input pause");
+  require(!session.capture.video_allowed(10, 0, true) && !session.capture.video_allowed(100, ticket->generation, true),
+    "neither old video nor an unobserved target can cross the boundary");
+  std::uint32_t sample_generation = 0;
+  require(session.capture.observe_source(100, false, &sample_generation) && sample_generation == ticket->generation,
+    "first real exact source is tagged with the requested generation");
+  require(run(display_list).generation == ticket->generation && !run(display_list).first_frame &&
+    !session.capture.video_allowed(100, ticket->generation, false), "discard dummy and non-IDR output until the first sent target IDR");
+  require(!session.capture.presented(ticket->generation, 0xffffffffu, enable_route), "a captured or encoded frame is not yet sent");
+  session.capture.video_sent(20, ticket->generation, 20, true);
+  session.capture.video_sent(100, ticket->generation, 21, false);
+  require(!run(display_list).first_frame, "wrong target and non-IDR cannot be published");
+  session.capture.video_sent(100, ticket->generation, 0xffffffffu, true);
+  session.capture.video_sent(100, ticket->generation, 1, false);
+  require(run(display_list).active == 10 && run(display_list).first_frame == 0xffffffffu, "wire retains old active until barrier");
+  require(!session.capture.presented(ticket->generation + 1, 1, enable_route), "different generation cannot be accepted");
+  require(!session.capture.presented(ticket->generation, 0, enable_route), "a hole in wrapped frame numbers was never sent");
+  require(!session.capture.presented(ticket->generation, 2, enable_route), "future frame was never sent");
+  require(!session.capture.presented(ticket->generation, 1, [](display_id) { return false; }), "input route must be ready");
+  require(session.capture.presented(ticket->generation, 1, enable_route), "accept an actual wrapped frame in this encrypted generation");
+  require(!session.capture.presented(ticket->generation, 1, enable_route), "duplicate presentation cannot thaw input again");
   require(run(to_virtual).state == status::ok && run(display_list).active == 100, "confirm exact and deduplicate completed selection");
+  require(run(display_list).can_select, "switch capability remains after confirmation");
   require(run(remove_virtual).state == status::in_use, "cannot remove confirmed live target");
   driver.ready = false;
   require(session.lost_target() && !run(display_list).active, "disappeared target must not be reported active");
   driver.ready = true;
   require(run(to_primary).state == status::pending && run(remove_virtual).state == status::in_use, "protect the previous capture while switching");
   const auto restore = session.capture.take_pending();
-  require(restore && session.capture.confirm(*restore), "confirm old virtual capture has retired");
+  require(restore && restore->generation != ticket->generation && session.capture.begin(*restore) &&
+    session.capture.observe_source(10, false), "explicit physical target gets a fresh generation");
+  session.capture.video_sent(10, restore->generation, 0, true);
+  require(run(display_list).first_frame.has_value() && *run(display_list).first_frame == 0,
+    "a real first frame at the uint32 rollover is present and distinct from an absent frame");
+  require(!session.capture.presented(ticket->generation, 1, enable_route) &&
+    session.capture.presented(restore->generation, 0, enable_route), "old generations cannot enable the new target's route");
   driver.close_succeeds = false;
   require(run(remove_virtual).state == status::cleanup_unconfirmed && driver.closes == 1, "unconfirmed native close cannot report success");
   require(run(to_virtual).state == status::not_ready, "retiring lease is not selectable");
@@ -166,7 +196,7 @@ int main() {
   require(run(command {select, 101}).state == status::pending, "shutdown with queued target");
   const auto queued = session.capture.take_pending();
   session.capture.close();
-  require(queued && !session.capture.confirm(*queued) && !session.capture.take_pending() && driver.mounted,
+  require(queued && !session.capture.presented(queued->generation, 2, enable_route) && !session.capture.take_pending() && driver.mounted,
     "close requests before joining while keeping the lease alive");
   require(session.cleanup() && !driver.mounted, "release after capture and input teardown");
 

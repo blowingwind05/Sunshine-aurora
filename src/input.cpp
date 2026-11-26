@@ -23,6 +23,7 @@ extern "C" {
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <variant>
 
 // lib includes
 #include <boost/endian/buffers.hpp>
@@ -36,6 +37,9 @@ extern "C" {
 #include "platform/virtualhid_input.h"
 #include "thread_pool.h"
 #include "utility.h"
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  #include "platform/macos/aurora_capture_target.h"
+#endif
 
 // Win32 WHEEL_DELTA constant
 #ifndef WHEEL_DELTA
@@ -45,6 +49,63 @@ constexpr int WHEEL_DELTA = 120;  ///< Standard Windows wheel delta used to norm
 using namespace std::literals;
 
 namespace input {
+
+  /** @brief Per-stream pointer state, mutated only in the ordered input queue. */
+  class display_pointer_gate {
+  public:
+    /** @brief Suspend an existing route for a newer display generation. */
+    bool begin(std::uint32_t next) {
+      if (phase == phase_e::closed || next <= generation) {
+        return false;
+      }
+      generation = next;
+      phase = phase_e::paused;
+      positioned = false;
+      return true;
+    }
+
+    /** @brief Acknowledge only the current pending generation. */
+    bool awaiting(std::uint32_t candidate) const {
+      return phase == phase_e::paused && generation == candidate;
+    }
+
+    /** @brief Open the route after the reliable marker passes the control validator. */
+    void enable() {
+      phase = phase_e::routed;
+    }
+
+    /** @brief Permanently suspend this stream until its retained input state is rebound. */
+    void close() {
+      phase = phase_e::closed;
+      positioned = false;
+    }
+
+    /** @brief Inspect the delivery states without changing the active generation. */
+    bool legacy() const { return phase == phase_e::legacy; }
+    bool routed() const { return phase == phase_e::routed; }
+    bool closed() const { return phase == phase_e::closed; }
+    bool has_position() const { return positioned; }
+
+    /** @brief Require a successful absolute move before delivering a click or wheel event. */
+    void did_position(bool delivered) {
+      positioned = delivered;
+    }
+
+  private:
+    enum class phase_e { legacy, paused, routed, closed };
+    phase_e phase = phase_e::legacy;
+    std::uint32_t generation = 0;
+    bool positioned = false;
+  };
+
+  /** @brief Decrypted packet and its origin proof supplied by the control transport. */
+  struct queued_input_packet {
+    std::vector<std::uint8_t> bytes;
+    bool reliable_mouse;
+  };
+
+  using ordered_input_work = std::function<void(const std::shared_ptr<input_t> &)>;  ///< Control work in the same FIFO as packets.
+  using input_queue_entry = std::variant<queued_input_packet, ordered_input_work>;  ///< Ordered packet or lifecycle operation.
 
   constexpr auto MAX_GAMEPADS = std::min((std::size_t) platf::MAX_GAMEPADS, sizeof(std::int16_t) * 8);  ///< Maximum gamepads representable by the active gamepad mask.
 /**
@@ -296,8 +357,13 @@ namespace input {
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;  ///< Touch port event.
     platf::feedback_queue_t feedback_queue;  ///< Queue used to deliver controller feedback to the platform backend.
 
-    std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
+    std::list<input_queue_entry> input_queue;  ///< Validated packets and display transition work in arrival order.
     std::mutex input_queue_lock;  ///< Input queue lock.
+    bool input_worker_scheduled = false;  ///< Exactly one drainer may be outstanding for this FIFO.
+    display_pointer_gate pointer_gate;  ///< Per-stream display barrier and pointer state.
+    display_barrier_validator_t display_validator;  ///< Validator for the current pending generation.
+    std::bitset<BUTTON_X2 + 1> legacy_buttons;  ///< Buttons actually pressed on the legacy pointer route by this stream.
+    std::uint64_t legacy_release_epoch = 0;  ///< Invalidate delayed legacy releases when the route closes.
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;  ///< Mouse left button timeout.
 
@@ -402,6 +468,9 @@ namespace input {
    * @param mail Mailbox for the resumed stream connection.
    */
   void rebind_input(const std::shared_ptr<input_t> &input, const safe::mail_t &mail) {
+    input->pointer_gate = {};
+    input->display_validator = {};
+    input->touch_port = {};
     input->touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     input->feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
 
@@ -821,7 +890,10 @@ namespace input {
       return;
     }
 
-    if (input->mouse_left_button_timeout == DISABLE_LEFT_BUTTON_DELAY) {
+    const bool routed = input->pointer_gate.routed();
+    if (routed) {
+      input->pointer_gate.did_position(false);
+    } else if (input->mouse_left_button_timeout == DISABLE_LEFT_BUTTON_DELAY) {
       input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
     }
 
@@ -830,14 +902,13 @@ namespace input {
 
     // Prevent divide by zero
     // Don't expect it to happen, but just in case
-    if (!packet->width || !packet->height) {
+    const auto width = static_cast<float>(util::endian::big(packet->width));
+    const auto height = static_cast<float>(util::endian::big(packet->height));
+    if (width <= 0 || height <= 0) {
       BOOST_LOG(warning) << "Moonlight passed invalid dimensions"sv;
 
       return;
     }
-
-    auto width = (float) util::endian::big(packet->width);
-    auto height = (float) util::endian::big(packet->height);
 
     auto tpcoords = client_to_touchport(input, {x, y}, {width, height});
     if (!tpcoords) {
@@ -865,7 +936,28 @@ namespace input {
       touch_port.logical_height,
     };
 
-    platf::abs_mouse(platf_input, abs_port, tpcoords->first, tpcoords->second);
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    if (routed) {
+      bool delivered = false;
+      platf::aurora_capture_absolute_mouse(abs_port, tpcoords->first, tpcoords->second, &delivered);
+      input->pointer_gate.did_position(delivered);
+      return;
+    }
+#endif
+    if (std::isfinite(tpcoords->first) && std::isfinite(tpcoords->second)) {
+      platf::abs_mouse(platf_input, abs_port, tpcoords->first, tpcoords->second);
+      if (routed) {
+        input->pointer_gate.did_position(true);
+      }
+    }
+  }
+
+  /** @brief Track actual legacy sends separately from the delayed release and packet deduplication state. */
+  void send_legacy_button(input_t &input, int button, bool release) {
+    platf::button_mouse(platf_input, button, release);
+    if (button > 0 && button < static_cast<int>(input.legacy_buttons.size())) {
+      input.legacy_buttons.set(button, !release);
+    }
   }
 
   /**
@@ -881,6 +973,18 @@ namespace input {
 
     auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
     auto button = util::endian::big(packet->button);
+    if (input->pointer_gate.routed()) {
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+      // An exact selection that disappeared must not fall back to the primary-display mouse.
+      platf::aurora_capture_button_mouse(button, release);
+#else
+      if (button > 0 && button < static_cast<int>(input->legacy_buttons.size()) &&
+          input->legacy_buttons.test(button) == release) {
+        send_legacy_button(*input, button, release);
+      }
+#endif
+      return;
+    }
     if (button > 0 && button < mouse_press.size()) {
       if (mouse_press[button] != release) {
         // button state is already what we want
@@ -904,13 +1008,18 @@ namespace input {
      * when the last mouse coordinates were absolute
      */
     if (button == BUTTON_LEFT && release && !input->mouse_left_button_timeout) {
+      const auto release_epoch = input->legacy_release_epoch;
       auto f = [=]() {
+        if (input->legacy_release_epoch != release_epoch || !input->pointer_gate.legacy() ||
+            !input->legacy_buttons.test(BUTTON_LEFT)) {
+          return;
+        }
         auto left_released = mouse_press[BUTTON_LEFT];
         if (left_released) {
           // Already released left button
           return;
         }
-        platf::button_mouse(platf_input, BUTTON_LEFT, release);
+        send_legacy_button(*input, BUTTON_LEFT, release);
 
         mouse_press[BUTTON_LEFT] = false;
         input->mouse_left_button_timeout = nullptr;
@@ -924,15 +1033,15 @@ namespace input {
       button == BUTTON_RIGHT && !release &&
       input->mouse_left_button_timeout > DISABLE_LEFT_BUTTON_DELAY
     ) {
-      platf::button_mouse(platf_input, BUTTON_RIGHT, false);
-      platf::button_mouse(platf_input, BUTTON_RIGHT, true);
+      send_legacy_button(*input, BUTTON_RIGHT, false);
+      send_legacy_button(*input, BUTTON_RIGHT, true);
 
       mouse_press[BUTTON_RIGHT] = false;
 
       return;
     }
 
-    platf::button_mouse(platf_input, button, release);
+    send_legacy_button(*input, button, release);
   }
 
   /**
@@ -1212,24 +1321,38 @@ namespace input {
     update_shortcutFlags(*input, keyCode, release);
   }
 
-  /**
-   * @brief Called to pass a vertical scroll message the platform backend.
-   * @param input The input context pointer.
-   * @param packet The scroll packet.
-   */
+  /** @brief Send wheel motion through the same route as the active pointer. */
+  void send_scroll(input_t &input, int vertical, int horizontal) {
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    if (input.pointer_gate.routed()) {
+      platf::aurora_capture_scroll(vertical, horizontal);
+      return;
+    }
+#else
+    (void) input;
+#endif
+    if (vertical) {
+      platf::scroll(platf_input, vertical);
+    }
+    if (horizontal) {
+      platf::hscroll(platf_input, horizontal);
+    }
+  }
+
+  /** @brief Decode and accumulate a vertical scroll packet. */
   void passthrough(std::shared_ptr<input_t> &input, PNV_SCROLL_PACKET packet) {
     if (!config::input.mouse) {
       return;
     }
 
     if (config::input.high_resolution_scrolling) {
-      platf::scroll(platf_input, util::endian::big(packet->scrollAmt1));
+      send_scroll(*input, util::endian::big(packet->scrollAmt1), 0);
     } else {
       input->accumulated_vscroll_delta += util::endian::big(packet->scrollAmt1);
       auto full_ticks = input->accumulated_vscroll_delta / WHEEL_DELTA;
       if (full_ticks) {
         // Send any full ticks that have accumulated and store the rest
-        platf::scroll(platf_input, full_ticks * WHEEL_DELTA);
+        send_scroll(*input, full_ticks * WHEEL_DELTA, 0);
         input->accumulated_vscroll_delta -= full_ticks * WHEEL_DELTA;
       }
     }
@@ -1246,13 +1369,13 @@ namespace input {
     }
 
     if (config::input.high_resolution_scrolling) {
-      platf::hscroll(platf_input, util::endian::big(packet->scrollAmount));
+      send_scroll(*input, 0, util::endian::big(packet->scrollAmount));
     } else {
       input->accumulated_hscroll_delta += util::endian::big(packet->scrollAmount);
       auto full_ticks = input->accumulated_hscroll_delta / WHEEL_DELTA;
       if (full_ticks) {
         // Send any full ticks that have accumulated and store the rest
-        platf::hscroll(platf_input, full_ticks * WHEEL_DELTA);
+        send_scroll(*input, 0, full_ticks * WHEEL_DELTA);
         input->accumulated_hscroll_delta -= full_ticks * WHEEL_DELTA;
       }
     }
@@ -1704,6 +1827,9 @@ namespace input {
     }
 
     switch (util::endian::little(header.magic)) {
+      case AURORA_DISPLAY_BARRIER:
+        return declared_size == sizeof(header.magic) + 2 * sizeof(std::uint32_t) &&
+               packet.size() == sizeof(header) + 2 * sizeof(std::uint32_t);
       case MOUSE_MOVE_REL_MAGIC_GEN5:
         return validate_fixed_input_packet<NV_REL_MOUSE_MOVE_PACKET>(packet, declared_size);
       case MOUSE_MOVE_ABS_MAGIC:
@@ -2019,56 +2145,104 @@ namespace input {
     }
   }
 
-  /**
-   * @brief Called on a thread pool thread to process an input message.
-   * @param input The input context pointer.
-   */
-  void passthrough_next_message(std::shared_ptr<input_t> input) {
-    // 'entry' backs the 'payload' pointer, so they must remain in scope together
-    std::vector<uint8_t> entry;
-    PNV_INPUT_HEADER payload;
+  /** @brief Filter display-routed pointer classes without affecting keyboard or gamepad input. */
+  bool allow_pointer_packet(const input_t &input, std::uint32_t magic, bool reliable_mouse) {
+    const bool absolute = magic == MOUSE_MOVE_ABS_MAGIC;
+    const bool release = magic == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
+    const bool action = magic == MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5 || release ||
+                        magic == SCROLL_MAGIC_GEN5 || magic == SS_HSCROLL_MAGIC;
+    if (!absolute && !action && magic != MOUSE_MOVE_REL_MAGIC_GEN5 && magic != SS_TOUCH_MAGIC && magic != SS_PEN_MAGIC) {
+      return true;
+    }
+    if (input.pointer_gate.legacy()) {
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+      return !platf::aurora_capture_target_active();
+#else
+      return true;
+#endif
+    }
+    return input.pointer_gate.routed() && reliable_mouse && (absolute || release || (action && input.pointer_gate.has_position()));
+  }
 
-    // Lock the input queue while batching, but release it before sending
-    // the input to the OS. This avoids potentially lengthy lock contention
-    // in the control stream thread while input is being processed by the OS.
+  /** @brief Parse a validated reliable barrier on the ordered input worker. */
+  void receive_display_barrier(input_t &input, const queued_input_packet &packet) {
+    if (!packet.reliable_mouse || !input.display_validator) {
+      return;
+    }
+    std::uint32_t words[2] {};
+    std::memcpy(words, packet.bytes.data() + sizeof(NV_INPUT_HEADER), sizeof(words));
+    const auto generation = util::endian::big(words[0]);
+    const auto presented = util::endian::big(words[1]);
+    if (input.pointer_gate.awaiting(generation) && input.display_validator(generation, presented)) {
+      input.pointer_gate.enable();
+      input.display_validator = {};
+    }
+  }
+
+  /** @brief Process the next FIFO entry, keeping adjacent packet batching inside one generation. */
+  void process_next_input(std::shared_ptr<input_t> input) {
+    input_queue_entry entry;
     {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
-
-      // If all entries have already been processed, nothing to do
+      std::lock_guard lock {input->input_queue_lock};
       if (input->input_queue.empty()) {
         return;
       }
-
-      // Pop off the first entry, which we will send
-      entry = input->input_queue.front();
-      payload = (PNV_INPUT_HEADER) entry.data();
+      entry = std::move(input->input_queue.front());
       input->input_queue.pop_front();
 
-      // Try to batch with remaining items on the queue
-      auto i = input->input_queue.begin();
-      while (i != input->input_queue.end()) {
-        auto batchable_entry = *i;
-        auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data();
-
-        auto batch_result = batch(payload, batchable_payload);
-        if (batch_result == batch_result_e::terminate_batch) {
-          // Stop batching
-          break;
-        } else if (batch_result == batch_result_e::batched) {
-          // Erase this entry since it was batched
-          i = input->input_queue.erase(i);
-        } else {
-          // We couldn't batch this entry, but try to batch later entries.
-          i++;
+      if (const auto packet = std::get_if<queued_input_packet>(&entry)) {
+        const auto payload = reinterpret_cast<PNV_INPUT_HEADER>(packet->bytes.data());
+        auto it = input->input_queue.begin();
+        while (it != input->input_queue.end()) {
+          const auto later = std::get_if<queued_input_packet>(&*it);
+          if (!later || packet->reliable_mouse != later->reliable_mouse) {
+            break;
+          }
+          const auto batchable = reinterpret_cast<PNV_INPUT_HEADER>(later->bytes.data());
+          const auto result = batch(payload, batchable);
+          if (result == batch_result_e::terminate_batch) {
+            break;
+          }
+          if (result == batch_result_e::batched) {
+            it = input->input_queue.erase(it);
+          } else {
+            ++it;
+          }
         }
       }
+    }
+
+    if (const auto work = std::get_if<ordered_input_work>(&entry)) {
+      try {
+        (*work)(input);
+      } catch (...) {
+        BOOST_LOG(warning) << "Aurora display input callback failed";
+      }
+      return;
+    }
+    if (input->pointer_gate.closed()) {
+      return;
+    }
+    auto &packet = std::get<queued_input_packet>(entry);
+    auto payload = reinterpret_cast<PNV_INPUT_HEADER>(packet.bytes.data());
+    const auto magic = util::endian::little(payload->magic);
+    if (magic == AURORA_DISPLAY_BARRIER) {
+      try {
+        receive_display_barrier(*input, packet);
+      } catch (...) {
+        BOOST_LOG(warning) << "Aurora display barrier validation failed";
+      }
+      return;
+    }
+    if (!allow_pointer_packet(*input, magic, packet.reliable_mouse)) {
+      return;
     }
 
     // Print the final input packet
     input::print((void *) payload);
 
     // Send the batched input to the OS
-    switch (util::endian::little(payload->magic)) {
+    switch (magic) {
       case MOUSE_MOVE_REL_MAGIC_GEN5:
         passthrough(input, (PNV_REL_MOUSE_MOVE_PACKET) payload);
         break;
@@ -2116,12 +2290,38 @@ namespace input {
     }
   }
 
-  /**
-   * @brief Called on the control stream thread to queue an input message.
-   * @param input The input context pointer.
-   * @param input_data The input message.
-   */
-  void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data) {
+  /** @brief Process one queued packet or operation and schedule the next turn. */
+  void passthrough_next_message(std::shared_ptr<input_t> input) {
+    auto next = util::fail_guard([&] {
+      {
+        std::lock_guard lock {input->input_queue_lock};
+        if (input->input_queue.empty()) {
+          input->input_worker_scheduled = false;
+          return;
+        }
+      }
+      task_pool.push(passthrough_next_message, input);
+    });
+    process_next_input(input);
+  }
+
+  /** @brief Enqueue one packet or operation with a single outstanding worker for its FIFO. */
+  void enqueue_input_entry(const std::shared_ptr<input_t> &input, input_queue_entry entry) {
+    {
+      std::lock_guard lock {input->input_queue_lock};
+      input->input_queue.push_back(std::move(entry));
+      if (input->input_worker_scheduled) {
+        return;
+      }
+      input->input_worker_scheduled = true;
+    }
+    task_pool.push(passthrough_next_message, input);
+  }
+
+  void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data, bool reliable_mouse) {
+    if (!input) {
+      return;
+    }
     NV_INPUT_HEADER header {};
     if (!validate_input_packet(input_data, &header)) {
       if (input_data.size() >= sizeof(header)) {
@@ -2136,11 +2336,76 @@ namespace input {
       return;
     }
 
-    {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
-      input->input_queue.push_back(std::move(input_data));
+    if (util::endian::little(header.magic) == AURORA_DISPLAY_BARRIER && !reliable_mouse) {
+      return;
     }
-    task_pool.push(passthrough_next_message, input);
+    enqueue_input_entry(input, queued_input_packet {std::move(input_data), reliable_mouse});
+  }
+
+  /** @brief Balance actual old-route button events before a display callback, then forget its viewport. */
+  void release_display_pointer(input_t &input, bool exact) {
+    ++input.legacy_release_epoch;
+    if (input.mouse_left_button_timeout > DISABLE_LEFT_BUTTON_DELAY) {
+      task_pool.cancel(input.mouse_left_button_timeout);
+    }
+    input.mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
+    for (std::size_t button = 1; button < input.legacy_buttons.size(); ++button) {
+      if (input.legacy_buttons.test(button)) {
+        send_legacy_button(input, static_cast<int>(button), true);
+        if (button < mouse_press.size()) {
+          mouse_press[button] = false;
+        }
+      }
+    }
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    if (exact) {
+      platf::aurora_capture_pause_pointer();
+    }
+#else
+    (void) exact;
+#endif
+    input.accumulated_vscroll_delta = 0;
+    input.accumulated_hscroll_delta = 0;
+    input.touch_port = {};
+    input.touch_port_event->try_pop();
+  }
+
+  bool enqueue_display_switch(const std::shared_ptr<input_t> &input, std::uint32_t generation,
+                              std::function<void()> on_paused, display_barrier_validator_t validate_barrier) {
+    if (!input || !generation || !on_paused || !validate_barrier) {
+      return false;
+    }
+    enqueue_input_entry(input, ordered_input_work {
+      [generation, on_paused = std::move(on_paused), validate_barrier = std::move(validate_barrier)](const auto &input) {
+        if (!input->pointer_gate.begin(generation)) {
+          return;
+        }
+        input->display_validator = {};
+        release_display_pointer(*input, true);
+        on_paused();
+        input->display_validator = validate_barrier;
+      }
+    });
+    return true;
+  }
+
+  void enqueue_display_stop(const std::shared_ptr<input_t> &input, std::function<void()> on_stopped) {
+    if (!input) {
+      return;
+    }
+    enqueue_input_entry(input, ordered_input_work {
+      [on_stopped = std::move(on_stopped)](const auto &input) {
+        if (!input->pointer_gate.closed()) {
+          const bool managed = !input->pointer_gate.legacy();
+          input->pointer_gate.close();
+          input->display_validator = {};
+          release_display_pointer(*input, managed);
+        }
+        if (on_stopped) {
+          on_stopped();
+        }
+      }
+    });
   }
 
   /**
@@ -2200,7 +2465,12 @@ namespace input {
    * @param input Retained stream input state to reset.
    */
   void reset_input_state(const std::shared_ptr<input_t> &input) {
-    reset_mouse_buttons();
+    if (!input->pointer_gate.closed()) {
+      const bool managed = !input->pointer_gate.legacy();
+      input->pointer_gate.close();
+      input->display_validator = {};
+      release_display_pointer(*input, managed);
+    }
     reset_keyboard_keys();
     reset_gamepads(input);
   }
@@ -2210,10 +2480,7 @@ namespace input {
    */
   void reset(std::shared_ptr<input_t> &input) {
     task_pool.cancel(key_press_repeat_id);
-    task_pool.cancel(input->mouse_left_button_timeout);
-
-    // Ensure input is synchronous, by using the task_pool
-    task_pool.push(reset_input_state, input);
+    enqueue_input_entry(input, ordered_input_work {reset_input_state});
   }
 
   void terminate_gamepads() {
@@ -2326,15 +2593,26 @@ namespace input {
     }
 
     if (resumed) {
-      dispatch_input_task([input, mail = std::move(mail)]() {
+      if (task_pool.running()) {
+        enqueue_input_entry(input, ordered_input_work {[mail = std::move(mail)](const auto &input) {
+          rebind_input(input, mail);
+        }});
+      } else {
         rebind_input(input, mail);
-      });
+      }
     }
 
     // Workaround to ensure new frames will be captured when a client connects
-    task_pool.pushDelayed([]() {
-      platf::move_mouse(platf_input, 1, 1);
-      platf::move_mouse(platf_input, -1, -1);
+    task_pool.pushDelayed([input]() {
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+      if (platf::aurora_capture_target_active()) {
+        return;
+      }
+#endif
+      if (input->pointer_gate.legacy()) {
+        platf::move_mouse(platf_input, 1, 1);
+        platf::move_mouse(platf_input, -1, -1);
+      }
     },
                           100ms);
 
@@ -2390,6 +2668,18 @@ namespace input {
 
     bool is_valid_input_packet(std::span<const std::uint8_t> packet) {
       return ::input::validate_input_packet(packet);
+    }
+
+    void process_next_input(const std::shared_ptr<input_t> &input) {
+      ::input::process_next_input(input);
+    }
+
+    bool allows_pointer_packet(const std::shared_ptr<input_t> &input, std::uint32_t magic, bool reliable_mouse) {
+      return !input->pointer_gate.closed() && ::input::allow_pointer_packet(*input, magic, reliable_mouse);
+    }
+
+    void set_pointer_positioned(const std::shared_ptr<input_t> &input, bool delivered) {
+      input->pointer_gate.did_position(delivered);
     }
 
     std::size_t queued_input_packet_count(const std::shared_ptr<input_t> &input) {

@@ -37,6 +37,9 @@ extern "C" {
 #include "platform/common.h"
 #include "sync.h"
 #include "video.h"
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  #include "src/platform/macos/aurora_capture_target.h"
+#endif
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   #include "aurora_video_bitrate.h"
 #endif
@@ -651,7 +654,7 @@ namespace video {
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;  ///< Event carrying updated touch viewport metadata.
 
     config_t config;  ///< Stream or encoder configuration captured for the worker.
-    int frame_nr;  ///< Next capture-frame number assigned to encoded packets.
+    std::int64_t frame_nr;  ///< Encoder PTS keeps increasing across the 32-bit RTP frame-number wrap.
     void *channel_data;  ///< Platform-specific channel data forwarded to packet senders.
   };
 
@@ -1489,8 +1492,8 @@ namespace video {
   };
 
   static encoder_t *chosen_encoder;
-#ifdef AURORA_MACOS_PRIVACY_PREVIEW
-  bool aurora_privacy_uses_videotoolbox() {
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  bool aurora_uses_videotoolbox() {
     return chosen_encoder == &videotoolbox;
   }
 #endif
@@ -1543,6 +1546,16 @@ namespace video {
     // Refresh the display names
     auto old_display_names = std::move(display_names);
     display_names = platf::display_names(dev_type);
+
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    if (keep_current && platf::aurora_capture_target_active()) {
+      // The managed exact guard owns the single entry through failure and reinit.
+      // Do not apply normal fixed-display name matching or any fallback here.
+      current_display_index = 0;
+      display_names = platf::display_names(dev_type);
+      return display_names.size() == 1 && display_names.front() == "aurora:exact-display"sv;
+    }
+#endif
 
     // If we now have no displays, let's put the old display array back and fail
     if (display_names.empty() && keep_current && !current_display_name.empty()) {
@@ -1604,10 +1617,14 @@ namespace video {
     // Only the live stream worker enters this path. Encoder validation calls encode() separately.
     auto &session = *static_cast<stream::session_t *>(channel_data);
     const bool ordinary = frame && frame->ordinary_display_source;
-    if (!stream::session::aurora_display_capture(session).observe_source(id, ordinary)) {
+    std::uint32_t generation = 0;
+    if (!stream::session::aurora_display_capture(session).observe_source(id, ordinary, &generation)) {
       return false;
     }
-    encoder.display_source.observe(id, pts, ordinary);
+    if (encoder.display_source.observe(id, pts, ordinary, generation) && generation) {
+      // A dummy IDR may have been encoded before the first usable target sample.
+      encoder.request_idr_frame();
+    }
     return true;
   }
 #endif
@@ -1963,6 +1980,8 @@ namespace video {
 #if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
       packet->source_display_id = session.display_source.for_packet(av_packet->pts);
       packet->ordinary_display_source = session.display_source.allows_inventory();
+      packet->display_generation = session.display_source.generation_for_packet(av_packet->pts);
+      packet->real_display_sample = session.display_source.is_real_sample(av_packet->pts);
 #endif
 
       packet->replacements = &session.replacements;
@@ -2475,7 +2494,7 @@ namespace video {
    * @param bitrate Optional per-session request mailbox.
    */
   void encode_run(
-    int &frame_nr,  // Store progress of the frame number
+    std::int64_t &frame_nr,  // Keep the encoder PTS monotonic across RTP wrap and reinit.
     safe::mail_t mail,
     img_event_t images,
     config_t config,
@@ -3033,7 +3052,7 @@ namespace video {
       return;
     }
 
-    int frame_nr = 1;
+    std::int64_t frame_nr = 1;
 
     auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);

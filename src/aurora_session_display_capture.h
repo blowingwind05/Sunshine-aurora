@@ -4,8 +4,12 @@
  */
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 
@@ -14,7 +18,7 @@ namespace aurora::session_display {
 
   /** @brief A request may be acknowledged only by its assigned generation and exact target. */
   struct switch_request {
-    std::uint64_t generation;  ///< Monotonic within this stream.
+    std::uint32_t generation;  ///< Nonzero, never reused within this stream.
     display_id id;  ///< Requested native target.
     bool operator==(const switch_request &) const = default;
   };
@@ -26,6 +30,7 @@ namespace aurora::session_display {
     bool source_lost = false;  ///< The capture worker reported a changed or unknown source.
     display_id active = 0;  ///< Host-confirmed target, independent of the client presentation state.
     std::optional<switch_request> pending;  ///< Queued or in progress.
+    std::optional<std::uint32_t> first_frame;  ///< First successfully transmitted real target IDR.
     display_id failed = 0;  ///< Last rejected target, cleared by a new command.
   };
 
@@ -36,12 +41,18 @@ namespace aurora::session_display {
   class encoded_display_source {
   public:
     /** @brief Mark the first successful conversion and whether its capture excludes staged displays. */
-    void observe(display_id id, std::int64_t pts, bool ordinary) {
-      if (id && !source) {
+    bool observe(display_id id, std::int64_t pts, bool ordinary, std::uint32_t generation = 0) {
+      const bool first = id && !source;
+      if (first) {
         source = id;
         first_real_pts = pts;
         inventory_safe = ordinary;
+        source_generation = generation;
       }
+      if (source && id == source && generation == source_generation) {
+        real_pts[next++ % real_pts.size()] = pts;
+      }
+      return first;
     }
 
     /** @brief Attribute packets at or after the first real input PTS, including encoded duplicates. */
@@ -54,10 +65,24 @@ namespace aurora::session_display {
       return inventory_safe;
     }
 
+    /** @brief Attribute the packet to its encoder generation only when backed by the new real source. */
+    std::uint32_t generation_for_packet(std::int64_t pts) const {
+      return for_packet(pts) ? source_generation : 0;
+    }
+
+    /** @brief Distinguish actual converted samples from dummy and repeated encoder input. */
+    bool is_real_sample(std::int64_t pts) const {
+      return std::find(real_pts.begin(), real_pts.begin() + std::min(next, real_pts.size()), pts) !=
+             real_pts.begin() + std::min(next, real_pts.size());
+    }
+
   private:
     display_id source = 0;
     std::int64_t first_real_pts = 0;
     bool inventory_safe = false;
+    std::uint32_t source_generation = 0;
+    std::array<std::int64_t, 64> real_pts {};
+    std::size_t next = 0;
   };
 
   /** @brief Owned by one stream and shared only with its capture/input paths. */
@@ -70,9 +95,14 @@ namespace aurora::session_display {
     }
 
     /** @brief Bind the first real converted source, and reject a later change before it can be encoded. */
-    bool observe_source(display_id id, bool ordinary) {
+    bool observe_source(display_id id, bool ordinary, std::uint32_t *observed_generation = nullptr) {
       const std::lock_guard lock {mutex};
       if (!state.enabled || state.source_lost) return false;
+      if (state.pending && switching && id == state.pending->id && !ordinary) {
+        target_observed = true;
+        if (observed_generation) *observed_generation = state.pending->generation;
+        return true;
+      }
       if (!id || (source && (source != id || ordinary_source != ordinary))) {
         state.active = 0;
         state.inventory_safe = false;
@@ -81,6 +111,7 @@ namespace aurora::session_display {
       }
       source = id;
       ordinary_source = ordinary;
+      if (observed_generation) *observed_generation = active_generation;
       return true;
     }
 
@@ -119,36 +150,63 @@ namespace aurora::session_display {
       return state.pending;
     }
 
-    /** @brief Confirm only after the exact new target has produced a frame, input is mapped and old capture is retired. */
-    bool confirm(const switch_request &request) {
+    /** @brief Allow the capture worker to observe the target only after the input queue has been frozen. */
+    bool begin(const switch_request &request) {
       const std::lock_guard lock {mutex};
-      if (!taken || state.source_lost || state.pending != request || std::chrono::steady_clock::now() >= deadline) return false;
-      state.active = request.id;
-      source = request.id;
-      state.pending.reset();
-      taken = false;
+      if (!taken || switching || state.source_lost || state.pending != request || std::chrono::steady_clock::now() >= deadline) return false;
+      switching = true;
       return true;
     }
 
-    /** @brief Reject only if the prior confirmed capture and input target are still valid. Otherwise stop the stream. */
-    bool reject(const switch_request &request) {
+    /** @brief Reject stale or dummy video as the capture worker and sender cross the generation boundary. */
+    bool video_allowed(display_id id, std::uint32_t generation, bool real_idr) const {
       const std::lock_guard lock {mutex};
-      if (!taken || state.pending != request) return false;
+      if (state.source_lost) return false;
+      if (state.pending && switching) {
+        return target_observed && id == state.pending->id && generation == state.pending->generation && (state.first_frame || real_idr);
+      }
+      return active_generation == 0 || (generation == active_generation && id == state.active);
+    }
+
+    /** @brief Publish the first frame and record exact frame membership only after all frame datagrams were sent. */
+    void video_sent(display_id id, std::uint32_t generation, std::uint32_t frame, bool real_idr) {
+      const std::lock_guard lock {mutex};
+      if (!switching || !target_observed || !state.pending || state.pending->id != id || state.pending->generation != generation ||
+          std::chrono::steady_clock::now() >= deadline) return;
+      if (!state.first_frame) {
+        if (!real_idr) return;
+        state.first_frame = frame;
+      }
+      sent_frames[next_frame++ % sent_frames.size()] = frame;
+    }
+
+    /** @brief Validate an encrypted presentation barrier before reopening the exact target's input. */
+    bool presented(std::uint32_t generation, std::uint32_t frame, const std::function<bool(display_id)> &enable_input) {
+      const std::lock_guard lock {mutex};
+      if (!generation || !switching || state.source_lost || !state.pending || state.pending->generation != generation ||
+          !state.first_frame || std::chrono::steady_clock::now() >= deadline) return false;
+      const auto end = sent_frames.begin() + std::min(next_frame, sent_frames.size());
+      if (std::find(sent_frames.begin(), end, frame) == end || !enable_input(state.pending->id)) return false;
+      state.active = source = state.pending->id;
+      ordinary_source = false;
+      active_generation = generation;
       state.pending.reset();
-      state.failed = request.id;
-      taken = false;
+      state.first_frame.reset();
+      taken = switching = target_observed = false;
+      next_frame = 0;
       return true;
     }
 
     /** @brief Queue a target, collapsing retries for the pending or confirmed target. */
     submit_result submit(display_id id) {
       const std::lock_guard lock {mutex};
-      if (!id || !state.enabled || !state.active) return submit_result::unavailable;
+      if (!id || !state.enabled || !state.active || state.source_lost) return submit_result::unavailable;
       if (state.pending) return state.pending->id == id ? submit_result::pending : submit_result::busy;
       if (state.active == id) return submit_result::confirmed;
+      if (generation == std::numeric_limits<std::uint32_t>::max()) return submit_result::unavailable;
       state.failed = 0;
       state.pending = switch_request {++generation, id};
-      deadline = std::chrono::steady_clock::now() + std::chrono::seconds {8};
+      deadline = std::chrono::steady_clock::now() + std::chrono::seconds {15};
       exclusive = true;
       return submit_result::pending;
     }
@@ -177,7 +235,8 @@ namespace aurora::session_display {
       state = {};
       source = 0;
       ordinary_source = false;
-      taken = false;
+      taken = switching = target_observed = false;
+      next_frame = 0;
     }
 
   private:
@@ -186,8 +245,13 @@ namespace aurora::session_display {
     display_id source = 0;  ///< Exact source observed by the encoder before sender confirmation.
     bool ordinary_source = false;  ///< Whether the source came from the ordinary, stage-excluding path.
     std::chrono::steady_clock::time_point deadline {};
-    std::uint64_t generation = 0;
+    std::uint32_t generation = 0;
+    std::uint32_t active_generation = 0;
+    std::array<std::uint32_t, 4096> sent_frames {};  ///< Bounds membership even across the RTP frame-number wrap.
+    std::size_t next_frame = 0;
     bool taken = false;
+    bool switching = false;
+    bool target_observed = false;
     bool exclusive = false;  ///< Once switched, retain exclusive capture until workers join.
   };
 }

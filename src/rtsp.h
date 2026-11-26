@@ -63,6 +63,9 @@ namespace rtsp_stream {
     uint32_t control_connect_data;  ///< Client-provided token used when connecting the control channel.
 
     bool aurora_client_cursor = false;  ///< Exclude the cursor from captured video after successful negotiation.
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    bool aurora_display_switch = false;  ///< Paired client opted into the presentation barrier on this launch or resume.
+#endif
     bool host_audio;  ///< Whether host audio should be played locally.
     std::string unique_id;  ///< Moonlight client unique identifier for this launch request.
     int width;  ///< Frame or display width in pixels.

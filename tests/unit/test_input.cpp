@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 // moonlight-common-c includes
@@ -53,6 +54,14 @@ namespace {
     if (!packet.empty()) {
       std::memcpy(packet.data(), &header, std::min(packet.size(), sizeof(header)));
     }
+    return packet;
+  }
+
+  /** @brief Encode the Aurora barrier using the NV header and two exact big-endian words. */
+  std::vector<std::uint8_t> display_barrier(std::uint32_t generation, std::uint32_t frame) {
+    const std::array payload {util::endian::big(generation), util::endian::big(frame)};
+    auto packet = make_input_packet(input::AURORA_DISPLAY_BARRIER, 12, sizeof(NV_INPUT_HEADER) + sizeof(payload));
+    std::memcpy(packet.data() + sizeof(NV_INPUT_HEADER), payload.data(), sizeof(payload));
     return packet;
   }
 
@@ -114,6 +123,81 @@ namespace {
     config::input_t original_input_;  ///< Input configuration restored after each test.
   };
 }  // namespace
+
+TEST(InputDisplayBarrierTest, ConsumesOnlyExactPacketLength) {
+  auto packet = display_barrier(0x01020304, 0xF0E0D0C0);
+  EXPECT_TRUE(input::testing::is_valid_input_packet(packet));
+  packet.push_back(0);
+  EXPECT_FALSE(input::testing::is_valid_input_packet(packet));
+  packet.resize(sizeof(NV_INPUT_HEADER) + 7);
+  EXPECT_FALSE(input::testing::is_valid_input_packet(packet));
+}
+
+TEST_F(InputGamepadSessionTest, DisplayBarrierSerializesPauseValidationAndResume) {
+  auto session = input::alloc(std::make_shared<safe::mail_raw_t>(), "display-barrier-fixture");
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> calls;
+  const auto before = [&] { calls.emplace_back(0, 0); };
+  const auto validator = [&](std::uint32_t generation, std::uint32_t presented) {
+    calls.emplace_back(generation, presented);
+    return presented == 0xF0E0D0C0;
+  };
+  constexpr auto generation = 0x01020304;
+  const auto allowed = [&](std::uint32_t magic, bool reliable = true) {
+    return input::testing::allows_pointer_packet(session, magic, reliable);
+  };
+  const auto next = [&] { input::testing::process_next_input(session); };
+  EXPECT_FALSE(input::enqueue_display_switch(session, 0, before, validator));
+  input::passthrough(session, display_barrier(generation, 0xF0E0D0C0), true);
+  ASSERT_TRUE(input::enqueue_display_switch(session, generation, before, validator));
+  input::passthrough(session, display_barrier(generation, 0xF0E0D0C0), false);
+  input::passthrough(session, display_barrier(generation - 1, 0xF0E0D0C0), true);
+  input::passthrough(session, display_barrier(generation, 1), true);
+  input::passthrough(session, display_barrier(generation, 0xF0E0D0C0), true);
+
+  next();  // An early reliable barrier has no pending transition.
+  EXPECT_TRUE(calls.empty());
+  next();  // Old target would be released before this callback.
+  ASSERT_EQ(calls.size(), 1);
+  EXPECT_FALSE(allowed(MOUSE_MOVE_ABS_MAGIC));
+  EXPECT_FALSE(allowed(MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5));
+  EXPECT_TRUE(allowed(KEY_DOWN_EVENT_MAGIC, false));
+  next();  // Wrong generation has no effect. The unreliable marker was not enqueued.
+  EXPECT_EQ(calls.size(), 1);
+  next();  // Valid generation with unproven frame remains paused.
+  ASSERT_EQ(calls.size(), 2);
+  EXPECT_EQ(calls.back(), std::make_pair(static_cast<std::uint32_t>(generation), 1u));
+  EXPECT_FALSE(allowed(SCROLL_MAGIC_GEN5));
+  next();  // The specified frame is the only acknowledgement that opens the route.
+  ASSERT_EQ(calls.size(), 3);
+  EXPECT_EQ(calls.back(), std::make_pair(static_cast<std::uint32_t>(generation), 0xF0E0D0C0u));
+  EXPECT_TRUE(allowed(MOUSE_MOVE_ABS_MAGIC));
+  EXPECT_FALSE(allowed(MOUSE_MOVE_ABS_MAGIC, false));
+  EXPECT_FALSE(allowed(MOUSE_MOVE_REL_MAGIC_GEN5));
+  EXPECT_FALSE(allowed(MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5));
+  EXPECT_FALSE(allowed(SS_HSCROLL_MAGIC));
+  input::testing::set_pointer_positioned(session, true);
+  EXPECT_TRUE(allowed(MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5));
+  EXPECT_TRUE(allowed(SCROLL_MAGIC_GEN5));
+  EXPECT_TRUE(allowed(SS_HSCROLL_MAGIC));
+  EXPECT_FALSE(allowed(SS_TOUCH_MAGIC));
+  input::testing::set_pointer_positioned(session, false);
+  EXPECT_TRUE(allowed(MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5));
+
+  ASSERT_TRUE(input::enqueue_display_switch(session, generation, before, validator));
+  input::passthrough(session, display_barrier(generation, 0xF0E0D0C0), true);
+  next();
+  next();
+  EXPECT_EQ(calls.size(), 3);  // Duplicate begin and replay are harmless.
+  ASSERT_TRUE(input::enqueue_display_switch(session, generation + 1, before, validator));
+  next();
+  EXPECT_FALSE(allowed(MOUSE_MOVE_ABS_MAGIC));
+  input::enqueue_display_stop(session, before);
+  input::passthrough(session, display_barrier(generation + 1, 0xF0E0D0C0), true);
+  next();
+  next();
+  EXPECT_EQ(calls.size(), 5);
+  EXPECT_FALSE(allowed(MOUSE_MOVE_ABS_MAGIC));
+}
 
 TEST(InputPacketValidationTest, RejectsEveryBufferShorterThanTheHeader) {
   for (std::size_t actual_size = 0; actual_size < sizeof(NV_INPUT_HEADER); ++actual_size) {

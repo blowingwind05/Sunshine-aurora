@@ -62,4 +62,13 @@ namespace platf::mac_capture {
       std::clamp(y, static_cast<double>(target.y), static_cast<double>(target.y) + target.height - 1)
     };
   }
+
+  /** @brief Convert signed wheel deltas to Quartz pixels while retaining subpixel deltas. */
+  inline std::int32_t scroll_pixels(int delta, double &remainder) {
+    constexpr double pixels_per_delta = 10.0 / 120.0;
+    remainder += delta * pixels_per_delta;
+    const auto pixels = static_cast<std::int32_t>(std::trunc(remainder));
+    remainder -= pixels;
+    return pixels;
+  }
 }  // namespace platf::mac_capture

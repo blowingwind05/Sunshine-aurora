@@ -40,5 +40,10 @@ int main() {
   require(negative_edge && negative_edge->x == -1 && negative_edge->y == -1, "negative edge stays off the primary monitor");
   require(!absolute_point(*right, -960, -540, 960, 540, -100, -100) && !absolute_point(*right, 1470, 0, 1200, 720, 2110, 360), "discard old touch-port geometry");
   require(!absolute_point(*right, 1470, 0, 1280, 720, std::numeric_limits<double>::quiet_NaN(), 0), "discard invalid pointer");
+  double vertical = 0.0;
+  double horizontal = 0.0;
+  require(scroll_pixels(6, vertical) == 0 && scroll_pixels(-120, horizontal) == -10 &&
+            scroll_pixels(6, vertical) == 1 && scroll_pixels(0, horizontal) == 0,
+          "keep subpixel wheel motion and axis signs independent");
   std::puts("PASS: exact Mac capture geometry, scaling, stale touch ports, and absolute pointer bounds");
 }

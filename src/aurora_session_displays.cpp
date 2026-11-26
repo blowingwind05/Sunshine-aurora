@@ -33,6 +33,12 @@ namespace aurora::session_display {
       if (!legal_mode(static_cast<int>(active->width), static_cast<int>(active->height), fps)) return {};
       return display_mode {active->width, active->height, static_cast<unsigned>(fps)};
     }
+
+    /** @brief Compare pixel aspect ratios without rounding or overflowing 32-bit arithmetic. */
+    bool same_aspect(unsigned first_width, unsigned first_height, unsigned second_width, unsigned second_height) {
+      return first_width && first_height && second_width && second_height &&
+             std::uint64_t {first_width} * second_height == std::uint64_t {second_width} * first_height;
+    }
   }
 
   std::optional<command> parse(std::string_view query) {
@@ -75,7 +81,7 @@ namespace aurora::session_display {
   }
 
   result controller::describe(status state, display_id affected, const backend &platform,
-    const std::function<bool()> &authorized, bool switching_available) const {
+    const std::function<bool()> &authorized, bool switching_available, display_mode stream_mode) const {
     if (!authorized()) return result {status::denied};
     const auto capture_state = capture.snapshot();
     if (!capture_state.active) return result {status::not_ready};
@@ -84,7 +90,11 @@ namespace aurora::session_display {
 
     result reply {state};
     reply.affected = affected;
-    if (capture_state.pending) reply.pending = capture_state.pending->id;
+    if (capture_state.pending) {
+      reply.pending = capture_state.pending->id;
+      reply.generation = capture_state.pending->generation;
+      reply.first_frame = capture_state.first_frame;
+    }
     reply.failed = capture_state.failed;
     reply.can_select = switching_available;
     const bool inventory_allowed = (capture_state.inventory_safe || switching_available) && !capture_state.pending;
@@ -111,19 +121,26 @@ namespace aurora::session_display {
     if (!reply.active) {
       reply.can_create = false;
       if (reply.state == status::ok) reply.state = status::not_ready;
+    } else if (reply.can_select && !reply.pending) {
+      const auto active = std::ranges::find(reply.displays, reply.active, &display::id);
+      for (auto &target : reply.displays) {
+        target.selectable = target.ready &&
+                            same_aspect(active->width, active->height, target.width, target.height) &&
+                            (!stream_mode.width || same_aspect(stream_mode.width, stream_mode.height, target.width, target.height));
+      }
     }
     return authorized() ? std::move(reply) : result {status::denied};
   }
 
   result controller::apply(const command &request, const backend &platform, const std::function<bool()> &authorized,
-    bool switching_available) {
+    bool switching_available, display_mode stream_mode) {
     if (!authorized()) return result {status::denied};
     const auto state = capture.snapshot();
     if (!state.enabled) return result {status::unsupported};
     if (request.action == operation::select && !switching_available) return result {status::switch_unavailable};
     if (!state.active) return result {status::not_ready};
     const auto describe_now = [&](status state, display_id affected = 0) {
-      return describe(state, affected, platform, authorized, switching_available);
+      return describe(state, affected, platform, authorized, switching_available, stream_mode);
     };
     const auto describe_created = [&](display_id id) {
       auto reply = describe_now(status::ok, id);
@@ -163,16 +180,20 @@ namespace aurora::session_display {
           const bool closed = created->close();
           return describe_now(closed ? status::not_ready : status::cleanup_unconfirmed);
         }
-        owned.push_back({id, *mode, std::move(created)});
+        owned.push_back({id, *mode, std::shared_ptr<lease> {std::move(created)}});
         return describe_created(id);
       }
 
       case operation::select: {
+        if (state.pending) {
+          return describe_now(state.pending->id == request.id ? status::pending : status::busy, state.pending->id);
+        }
         const auto topology = describe_now(status::ok);
         if (topology.state != status::ok) return topology;
         const auto target = std::ranges::find(topology.displays, request.id, &display::id);
         if (target == topology.displays.end()) return describe_now(status::not_found);
         if (!target->ready) return describe_now(status::not_ready);
+        if (target->id != state.active && !target->selectable) return describe_now(status::incompatible_aspect);
         if (!authorized()) return result {status::denied};
         switch (capture.submit(request.id)) {
           case submit_result::confirmed: return describe_now(status::ok, request.id);
@@ -213,6 +234,12 @@ namespace aurora::session_display {
     const auto active = capture.snapshot().active;
     const auto owner = std::ranges::find(owned, active, &owned_display::id);
     return owner != owned.end() && (owner->retiring || !owner->native->ready());
+  }
+
+  std::shared_ptr<const lease> controller::lease_for(display_id id) const {
+    const auto owner = std::ranges::find(owned, id, &owned_display::id);
+    if (owner == owned.end() || owner->retiring) return {};
+    return owner->native;
   }
 
   bool controller::cleanup() {

@@ -33,7 +33,7 @@ namespace aurora::session_display {
   /** @brief Result observed by the caller. */
   enum class status {
     ok, pending, unsupported, denied, invalid_request, not_ready, busy,
-    not_found, in_use, capacity, unavailable, cleanup_unconfirmed, mode_unavailable, switch_unavailable
+    not_found, in_use, capacity, unavailable, cleanup_unconfirmed, mode_unavailable, switch_unavailable, incompatible_aspect
   };
 
   /** @brief A display and its observed, rather than requested, properties. */
@@ -45,6 +45,7 @@ namespace aurora::session_display {
     bool removable;
     unsigned width, height;
     double refresh_rate;
+    bool selectable = false;  ///< Ready exact owned target with a compatible pixel aspect ratio.
   };
 
   /** @brief HTTPS response snapshot. */
@@ -55,6 +56,8 @@ namespace aurora::session_display {
     display_id pending = 0;
     display_id failed = 0;
     display_id affected = 0;
+    std::uint32_t generation = 0;
+    std::optional<std::uint32_t> first_frame;
     bool can_create = false;
     bool can_select = false;  ///< True only in integrations that confirm a client-visible video generation.
     std::vector<display> displays;
@@ -95,13 +98,16 @@ namespace aurora::session_display {
 
     /** @brief Act while both the session and its certificate remain current. */
     result apply(const command &request, const backend &platform, const std::function<bool()> &authorized,
-      bool switching_available);
+      bool switching_available, display_mode stream_mode = {});
 
     /** @brief Whether admitting a parallel stream would share a controlled display. */
     bool exclusive() const;
 
     /** @brief Whether a confirmed Aurora-owned capture target disappeared from Quartz. */
     bool lost_target() const;
+
+    /** @brief Retain the live lease used to authorize an exact virtual target during reinit. */
+    std::shared_ptr<const lease> lease_for(display_id id) const;
 
     /** @brief Release all leases after video and input have stopped. */
     bool cleanup();
@@ -110,13 +116,13 @@ namespace aurora::session_display {
     struct owned_display {
       display_id id;
       display_mode mode;
-      std::unique_ptr<lease> native;
+      std::shared_ptr<lease> native;
       bool retiring = false;
     };
 
     /** @brief Scope topology to the session and recheck authorization before publishing it. */
     result describe(status state, display_id affected, const backend &platform,
-      const std::function<bool()> &authorized, bool switching_available) const;
+      const std::function<bool()> &authorized, bool switching_available, display_mode stream_mode) const;
 
     std::vector<owned_display> owned;
     std::set<display_id> removed;

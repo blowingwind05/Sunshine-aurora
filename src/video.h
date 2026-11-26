@@ -546,6 +546,8 @@ namespace video {
 #if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
     std::uint32_t source_display_id = 0;  ///< Exact Quartz ID on packets backed by a real capture sample.
     bool ordinary_display_source = false;  ///< The capture path excludes staged Aurora monitors.
+    std::uint32_t display_generation = 0;  ///< Generation propagated from this exact source in this encoder instance.
+    bool real_display_sample = false;  ///< The encoder received a fresh converted sample at this packet's PTS.
 #endif
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
@@ -696,8 +698,9 @@ namespace video {
    */
   using hdr_info_t = std::unique_ptr<hdr_info_raw_t>;
 
-#ifdef AURORA_MACOS_PRIVACY_PREVIEW
-  bool aurora_privacy_uses_videotoolbox();
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  /** @brief Whether the negotiated host encoder supports the exact macOS capture path. */
+  bool aurora_uses_videotoolbox();
 #endif
   extern int active_hevc_mode;
 

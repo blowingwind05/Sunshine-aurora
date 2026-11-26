@@ -5,6 +5,7 @@
 
 // standard includes
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -23,6 +24,7 @@
 #include "src/platform/macos/misc.h"
 #include "src/platform/macos/nv12_zero_device.h"
 #ifdef AURORA_SUNSHINE_HOST
+  #import <AppKit/NSEvent.h>
   #include "src/platform/macos/aurora_capture_geometry.h"
   #include "src/platform/macos/aurora_capture_target.h"
   #include "src/platform/macos/aurora_virtual_monitor.h"
@@ -69,6 +71,10 @@ namespace platf {
 #ifdef AURORA_SUNSHINE_HOST
   namespace {
     constexpr auto exact_capture_name = "aurora:exact-display"sv;  ///< Capture entry distinct from the encoder probe name.
+    // Moonlight orders left, middle, right, X1 and X2. Quartz orders left, right, middle, X1 and X2.
+    constexpr std::array<CGMouseButton, 5> pointer_buttons {
+      kCGMouseButtonLeft, kCGMouseButtonCenter, kCGMouseButtonRight, static_cast<CGMouseButton>(3), static_cast<CGMouseButton>(4)
+    };
 
     /** @brief One immutable target revision plus its guarded capture readiness. */
     struct exact_target_t {
@@ -77,6 +83,14 @@ namespace platf {
       bool ready = false;
       bool failed = false;
       bool input_enabled = false;
+      std::optional<mac_capture::point_t> pointer;  ///< Last valid remote Quartz point on this revision.
+      std::array<bool, pointer_buttons.size()> buttons {};  ///< Quartz events already posted by this revision.
+      int last_click_button = -1;
+      int click_count = 0;
+      std::chrono::steady_clock::time_point last_click {};
+      mac_capture::point_t last_click_position {};
+      double scroll_vertical = 0;
+      double scroll_horizontal = 0;
     };
 
     std::mutex exact_mutex;  ///< Protects the exclusive selection and readiness.
@@ -86,7 +100,7 @@ namespace platf {
     /** @brief Read the actual active display geometry without a primary-display fallback. */
     std::optional<mac_capture::geometry_t> exact_geometry(CGDirectDisplayID id) {
       if (!id || !CGDisplayIsOnline(id) || !CGDisplayIsActive(id) ||
-          CGDisplayIsAsleep(id) || CGDisplayIsInMirrorSet(id) || CGDisplayIsBuiltin(id)) {
+          CGDisplayIsAsleep(id) || CGDisplayIsInMirrorSet(id)) {
         return std::nullopt;
       }
       const auto mode = CGDisplayCopyDisplayMode(id);
@@ -100,13 +114,23 @@ namespace platf {
       return mac_capture::make_geometry(bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height, width, height);
     }
 
-    /** @brief Verify the requested ID against the Host-owned virtual monitor registry. */
-    std::shared_ptr<exact_target_t> prepare_exact_target(CGDirectDisplayID id) {
+    /** @brief Require exact lease evidence for a known or Aurora-branded virtual display. */
+    std::shared_ptr<exact_target_t> prepare_exact_target(CGDirectDisplayID id, const aurora_capture_lease_check &owns_virtual) {
       if (!id || config::aurora_privacy_screensaver || !is_screen_capture_allowed()) {
         return {};
       }
-      const auto owned = display_device::aurora_virtual_monitor_t::enumerate_owned();
-      if (!owned || std::none_of(owned->begin(), owned->end(), [id](const auto &display) { return display.id == id; })) {
+      using display_device::aurora_virtual_monitor_t;
+      const bool managed = aurora_virtual_monitor_t::owns_capture_id(id);
+      const bool aurora_branded = CGDisplayVendorNumber(id) == 0x4155 && CGDisplayModelNumber(id) == 0xA701;
+      if (owns_virtual) {
+        if (!managed || !owns_virtual(id)) {
+          return {};
+        }
+        const auto ready = aurora_virtual_monitor_t::enumerate_owned();
+        if (!ready || std::none_of(ready->begin(), ready->end(), [id](const auto &display) { return display.id == id; })) {
+          return {};
+        }
+      } else if (managed || aurora_branded) {
         return {};
       }
       const auto geometry = exact_geometry(id);
@@ -125,17 +149,86 @@ namespace platf {
       return current && mac_capture::same_geometry(*current, target.geometry);
     }
 
+    /** @brief Map each Quartz button to down, up or dragged event types. */
+    CGEventType pointer_event_type(CGMouseButton button, bool release, bool drag) {
+      if (button == kCGMouseButtonLeft) {
+        return drag ? kCGEventLeftMouseDragged : release ? kCGEventLeftMouseUp : kCGEventLeftMouseDown;
+      }
+      if (button == kCGMouseButtonRight) {
+        return drag ? kCGEventRightMouseDragged : release ? kCGEventRightMouseUp : kCGEventRightMouseDown;
+      }
+      return drag ? kCGEventOtherMouseDragged : release ? kCGEventOtherMouseUp : kCGEventOtherMouseDown;
+    }
+
+    /** @brief Post an already bounded event. A forced release keeps the old anchor without moving the cursor. */
+    bool post_pointer(const exact_target_t &target, mac_capture::point_t point, CGEventRef event, bool move) {
+      if (!event) {
+        return false;
+      }
+      const auto local = CGPointMake(point.x - target.geometry.x, point.y - target.geometry.y);
+      const bool posted = CGPreflightPostEventAccess() &&
+        (!move || CGDisplayMoveCursorToPoint(target.id, local) == kCGErrorSuccess);
+      if (posted) {
+        CGEventSetLocation(event, CGPointMake(point.x, point.y));
+        CGEventPost(kCGHIDEventTap, event);
+      }
+      CFRelease(event);
+      return posted;
+    }
+
+    /** @brief Create a mouse event with the correct drag/button identity and click count. */
+    CGEventRef make_pointer_event(CGEventType type, CGMouseButton button, mac_capture::point_t point, int clicks) {
+      const auto event = CGEventCreateMouseEvent(nullptr, type, CGPointMake(point.x, point.y), button);
+      if (event) {
+        CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, button);
+        CGEventSetIntegerValueField(event, kCGMouseEventClickState, clicks);
+      }
+      return event;
+    }
+
+    /** @brief End held gestures at the old point with the selection mutex held. */
+    void pause_pointer(exact_target_t &target) {
+      target.input_enabled = false;
+      if (target.pointer) {
+        for (std::size_t i = 0; i < target.buttons.size(); ++i) {
+          if (target.buttons[i]) {
+            const auto button = pointer_buttons[i];
+            post_pointer(target, *target.pointer,
+                         make_pointer_event(pointer_event_type(button, true, false), button, *target.pointer, target.click_count), false);
+          }
+        }
+      }
+      target.buttons.fill(false);
+      target.pointer.reset();
+      target.last_click_button = -1;
+      target.click_count = 0;
+      target.scroll_vertical = 0;
+      target.scroll_horizontal = 0;
+    }
+
+    /** @brief A selected revision may inject only while armed, frame-ready and at its original geometry. */
+    bool pointer_ready(exact_target_t &target) {
+      if (!target.input_enabled) {
+        return false;
+      }
+      if (!target.ready || target.failed || !target_geometry_matches(target)) {
+        pause_pointer(target);
+        return false;
+      }
+      return true;
+    }
+
     /** @brief Mark the old revision unavailable without touching a newer selection. */
     void mark_exact_failed(const std::shared_ptr<exact_target_t> &target) {
       std::lock_guard lock {exact_mutex};
       target->failed = true;
       target->ready = false;
-      target->input_enabled = false;
+      pause_pointer(*target);
     }
   }
 
-  std::unique_ptr<aurora_capture_target_t> aurora_select_capture_target(CGDirectDisplayID id) {
-    auto requested = prepare_exact_target(id);
+  std::unique_ptr<aurora_capture_target_t> aurora_select_capture_target(CGDirectDisplayID id, const aurora_capture_lease_check &owns_virtual) {
+    auto requested = prepare_exact_target(id, owns_virtual);
     if (!requested) {
       return {};
     }
@@ -149,8 +242,8 @@ namespace platf {
     return guard;
   }
 
-  bool aurora_capture_target_t::switch_to(CGDirectDisplayID id) {
-    auto requested = prepare_exact_target(id);
+  bool aurora_capture_target_t::switch_to(CGDirectDisplayID id, const aurora_capture_lease_check &owns_virtual) {
+    auto requested = prepare_exact_target(id, owns_virtual);
     if (!requested) {
       return false;
     }
@@ -158,6 +251,7 @@ namespace platf {
     if (exact_owner != this) {
       return false;
     }
+    pause_pointer(*exact_target);
     exact_target = std::move(requested);
     return true;
   }
@@ -175,13 +269,14 @@ namespace platf {
   void aurora_capture_target_t::disable_absolute_input() {
     std::lock_guard lock {exact_mutex};
     if (exact_owner == this) {
-      exact_target->input_enabled = false;
+      pause_pointer(*exact_target);
     }
   }
 
   aurora_capture_target_t::~aurora_capture_target_t() {
     std::lock_guard lock {exact_mutex};
     if (exact_owner == this) {
+      pause_pointer(*exact_target);
       exact_target.reset();
       exact_owner = nullptr;
     }
@@ -197,27 +292,96 @@ namespace platf {
              exact_target->id : kCGNullDirectDisplay;
   }
 
-  bool aurora_capture_absolute_mouse(const touch_port_t &port, float x, float y) {
+  bool aurora_capture_absolute_mouse(const touch_port_t &port, float x, float y, bool *delivered) {
+    if (delivered) {
+      *delivered = false;
+    }
     std::lock_guard lock {exact_mutex};
     if (!exact_target) {
       return false;
     }
-    if (!exact_target->input_enabled || !exact_target->ready || exact_target->failed || !target_geometry_matches(*exact_target)) {
+    auto &target = *exact_target;
+    if (!pointer_ready(target)) {
       return true;
     }
-    const auto point = mac_capture::absolute_point(exact_target->geometry, port.offset_x, port.offset_y,
+    const auto point = mac_capture::absolute_point(target.geometry, port.offset_x, port.offset_y,
                                                    port.logical_width, port.logical_height, x, y);
-    if (point && CGPreflightPostEventAccess()) {
-      const auto location = CGPointMake(point->x, point->y);
-      if (const auto event = CGEventCreateMouseEvent(nullptr, kCGEventMouseMoved, location, kCGMouseButtonLeft)) {
-        const auto local = CGPointMake(point->x - exact_target->geometry.x, point->y - exact_target->geometry.y);
-        if (CGDisplayMoveCursorToPoint(exact_target->id, local) == kCGErrorSuccess) {
-          CGEventPost(kCGHIDEventTap, event);
-        }
-        CFRelease(event);
+    if (!point) {
+      return true;
+    }
+    const auto held = std::find(target.buttons.begin(), target.buttons.end(), true);
+    const bool dragging = held != target.buttons.end();
+    const auto button = dragging ? pointer_buttons[held - target.buttons.begin()] : kCGMouseButtonLeft;
+    const auto type = dragging ? pointer_event_type(button, false, true) : kCGEventMouseMoved;
+    if (post_pointer(target, *point, make_pointer_event(type, button, *point, dragging ? target.click_count : 0), true)) {
+      target.pointer = point;
+      if (delivered) {
+        *delivered = true;
       }
     }
     return true;
+  }
+
+  bool aurora_capture_button_mouse(int button, bool release) {
+    std::lock_guard lock {exact_mutex};
+    if (!exact_target) {
+      return false;
+    }
+    auto &target = *exact_target;
+    if (!pointer_ready(target) || !target.pointer || button < 1 || button > static_cast<int>(pointer_buttons.size())) {
+      return true;
+    }
+    const auto index = static_cast<std::size_t>(button - 1);
+    if (target.buttons[index] == !release) {
+      return true;
+    }
+    const auto point = *target.pointer;
+    const auto now = std::chrono::steady_clock::now();
+    auto clicks = target.click_count;
+    if (!release) {
+      const bool repeat = button == target.last_click_button &&
+        now - target.last_click <= std::chrono::duration<double> {[NSEvent doubleClickInterval]} &&
+        std::hypot(point.x - target.last_click_position.x, point.y - target.last_click_position.y) <= 4.0;
+      clicks = repeat ? std::min(target.click_count + 1, 3) : 1;
+    }
+    const auto quartz_button = pointer_buttons[index];
+    if (post_pointer(target, point, make_pointer_event(pointer_event_type(quartz_button, release, false), quartz_button, point, clicks), true)) {
+      target.buttons[index] = !release;
+      if (!release) {
+        target.last_click = now;
+        target.last_click_button = button;
+        target.last_click_position = point;
+        target.click_count = clicks;
+      }
+    }
+    return true;
+  }
+
+  bool aurora_capture_scroll(int vertical, int horizontal) {
+    std::lock_guard lock {exact_mutex};
+    if (!exact_target) {
+      return false;
+    }
+    auto &target = *exact_target;
+    if (pointer_ready(target) && target.pointer && (vertical || horizontal)) {
+      const auto v = mac_capture::scroll_pixels(vertical, target.scroll_vertical);
+      const auto h = mac_capture::scroll_pixels(horizontal, target.scroll_horizontal);
+      if (v || h) {
+        const auto event = CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitPixel, 2, v, h);
+        if (event) {
+          CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, 1);
+        }
+        post_pointer(target, *target.pointer, event, true);
+      }
+    }
+    return true;
+  }
+
+  void aurora_capture_pause_pointer() {
+    std::lock_guard lock {exact_mutex};
+    if (exact_target) {
+      pause_pointer(*exact_target);
+    }
   }
 #endif
 
@@ -448,7 +612,7 @@ namespace platf {
       ~exact_av_display_t() override {
         std::lock_guard lock {exact_mutex};
         target->ready = false;
-        target->input_enabled = false;
+        pause_pointer(*target);
       }
 
       /** @brief Report intentional retargeting separately from failure or guard teardown. */
@@ -460,6 +624,7 @@ namespace platf {
         if (target->failed || !target_geometry_matches(*target)) {
           target->ready = false;
           target->failed = true;
+          pause_pointer(*target);
           return capture_e::error;
         }
         return capture_e::ok;
