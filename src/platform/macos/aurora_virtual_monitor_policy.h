@@ -158,6 +158,11 @@ namespace display_device::mac_virtual_monitor {
       return slots_[index].retired ? 0 : slots_[index].id;
     }
 
+    /** @brief Reserve known native IDs for Aurora during publication and delayed removal. */
+    bool contains(display_id_t id) const {
+      return id && std::any_of(slots_.begin(), slots_.end(), [id](const auto &slot) { return slot.id == id; });
+    }
+
   private:
     /** @brief Slot reservation, publication and release state. */
     struct entry_t {

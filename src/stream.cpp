@@ -501,7 +501,6 @@ namespace stream {
 
 #if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
     aurora::session_display::controller display_control;  ///< Leases and exact capture target for this stream only.
-    std::atomic<bool> sent_display_video = false;  ///< Actual output has reached the video sender.
 #endif
 
 #ifdef AURORA_MACOS_PRIVACY_PREVIEW
@@ -1862,8 +1861,13 @@ namespace stream {
           session->sent_video_frame.store(true, std::memory_order_release);
         }
 #elif defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
-        if (!session->sent_display_video.load(std::memory_order_relaxed)) {
-          session->sent_display_video.store(true, std::memory_order_release);
+        if (const auto source = packet->source_display_id) {
+          auto &capture = session->display_control.capture;
+          const bool confirmed = packet->ordinary_display_source ?
+            capture.report_inventory_ready(source) : capture.report_initial(source);
+          if (confirmed) {
+            BOOST_LOG(debug) << "Aurora confirmed Mac capture source " << source;
+          }
         }
 #endif
       } catch (const std::exception &e) {
@@ -2240,8 +2244,6 @@ namespace stream {
       const aurora::session_display::command &request, const std::function<bool()> &authorized) {
       namespace displays = aurora::session_display;
       if (!authorized()) return displays::result {displays::status::denied};
-      if (!session.display_control.capture.snapshot().enabled) return displays::result {displays::status::unsupported};
-      if (!session.sent_display_video.load(std::memory_order_acquire)) return displays::result {displays::status::not_ready};
       // A host-side capture acknowledgement alone cannot prove a new client-visible video generation.
       return session.display_control.apply(request, displays::mac_backend(), authorized, false);
     }
@@ -2251,7 +2253,8 @@ namespace stream {
     }
 
     bool aurora_display_failed(const session_t &session) {
-      return session.display_control.capture.expired() || session.display_control.lost_target();
+      return session.display_control.capture.snapshot().source_lost ||
+             session.display_control.capture.expired() || session.display_control.lost_target();
     }
 #endif
 
@@ -2514,6 +2517,9 @@ namespace stream {
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
 
       session->config = config;
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+      session->config.monitor.aurora_session_display_fixed = session->display_control.capture.snapshot().enabled;
+#endif
 
       session->control.connect_data = launch_session.control_connect_data;
       session->control.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);

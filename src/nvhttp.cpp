@@ -1449,6 +1449,12 @@ namespace nvhttp {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
     tree.put("root.AuroraSessionPrivacy", 1);
 #endif
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    if (!config::aurora_privacy_screensaver) {
+      tree.put("root.AuroraSessionDisplays", 1);
+      tree.put("root.AuroraSessionDisplaySelect", 0);
+    }
+#endif
     tree.put("root.MaxLumaPixelsHEVC", encoder.hevc_mode > 1 ? "1869449984" : "0");
 
     // Only include the MAC address for requests sent from paired clients over HTTPS.

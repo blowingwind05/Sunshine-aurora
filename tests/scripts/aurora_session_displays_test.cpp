@@ -111,7 +111,9 @@ int main() {
   require(run(display_list).state == status::unsupported, "unarmed stream");
   session.capture.enable();
   require(run(display_list).state == status::not_ready && !driver.snapshots, "require real first target");
-  require(!session.capture.report_initial(0) && session.capture.report_initial(10) && !session.capture.report_initial(20), "one initial capture");
+  require(!session.capture.report_initial(0) && !session.capture.report_initial(10) &&
+    session.capture.observe_source(10, false) && session.capture.report_initial(10) &&
+    !session.capture.report_initial(20), "one initial capture backed by a real source");
   const auto initial = run(display_list);
   require(initial.active == 10 && initial.can_create && initial.displays.size() == 2, "hide foreign lease");
   require(run(command {select, 99}).state == status::not_found, "foreign virtual target cannot be selected");
@@ -173,7 +175,16 @@ int main() {
   constexpr command create_default {create};
   const auto stage = [&](const auto &request) { return staging.apply(request, staging_driver, authorized, false); };
   staging.capture.enable();
-  require(staging.capture.report_initial(10), "host source can be observed before lease exclusion is proven");
+  encoded_display_source encoder;
+  encoder.observe(0, 1, true);
+  require(!encoder.for_packet(1) && !staging.capture.report_inventory_ready(10), "placeholder cannot confirm a capture ID");
+  require(staging.capture.observe_source(10, true), "first real frame records its Quartz ID");
+  encoder.observe(10, 5, true);
+  require(!encoder.for_packet(4) && encoder.for_packet(5) == 10 && encoder.for_packet(6) == 10 && encoder.allows_inventory(),
+    "delayed placeholders remain untagged while real output and encoded duplicates retain the ID");
+  require(stage(display_list).state == status::not_ready && !staging.capture.report_initial(20),
+    "sender must confirm the exact observed source before listing");
+  require(staging.capture.report_initial(encoder.for_packet(5)), "host source can be confirmed before lease exclusion is published");
   require(stage(display_list).active == 10 && !stage(display_list).can_create, "list works while staging remains gated");
   require(stage(to_virtual).state == status::switch_unavailable && !staging.capture.take_pending(), "production select cannot queue capture work");
   require(stage(create_default).state == status::not_ready && staging_driver.creations == 0, "cannot stage until capture excludes staged leases");
@@ -195,6 +206,9 @@ int main() {
   require(staging.capture.report_inventory_ready(10) && stage(remove_virtual).state == status::ok, "remove only staged, non-capture lease");
   staging_driver.next_id = 101;
   require(stage(create_1080).state == status::ok && staging_driver.requested_mode == display_mode {1920, 1080, 60}, "explicit override is still available");
+  require(!staging.capture.observe_source(20, true) && staging.capture.snapshot().source_lost &&
+    !staging.capture.report_inventory_ready(10) && stage(display_list).state == status::not_ready,
+    "a changed source revokes inventory and late packets cannot restore it");
   require(staging.cleanup(), "staging lease cleanup");
   std::puts("Aurora display command, capture acknowledgement and lease lifecycle passed");
 }

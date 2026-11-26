@@ -23,13 +23,42 @@ namespace aurora::session_display {
   struct capture_state {
     bool enabled = false;  ///< The stream can participate in this contract.
     bool inventory_safe = false;  ///< Ordinary capture excludes all staged session leases.
-    display_id active = 0;  ///< Last target confirmed by the capture and input paths.
+    bool source_lost = false;  ///< The capture worker reported a changed or unknown source.
+    display_id active = 0;  ///< Host-confirmed target, independent of the client presentation state.
     std::optional<switch_request> pending;  ///< Queued or in progress.
     display_id failed = 0;  ///< Last rejected target, cleared by a new command.
   };
 
   /** @brief Result of asking the current stream to switch to a specific display. */
   enum class submit_result { confirmed, pending, busy, unavailable };
+
+  /** @brief Track which packets came from a converted real sample in one encoder instance. */
+  class encoded_display_source {
+  public:
+    /** @brief Mark the first successful conversion and whether its capture excludes staged displays. */
+    void observe(display_id id, std::int64_t pts, bool ordinary) {
+      if (id && !source) {
+        source = id;
+        first_real_pts = pts;
+        inventory_safe = ordinary;
+      }
+    }
+
+    /** @brief Attribute packets at or after the first real input PTS, including encoded duplicates. */
+    display_id for_packet(std::int64_t pts) const {
+      return source && pts >= first_real_pts ? source : 0;
+    }
+
+    /** @brief Whether an attributed packet is from capture that excludes staged displays. */
+    bool allows_inventory() const {
+      return inventory_safe;
+    }
+
+  private:
+    display_id source = 0;
+    std::int64_t first_real_pts = 0;
+    bool inventory_safe = false;
+  };
 
   /** @brief Owned by one stream and shared only with its capture/input paths. */
   class capture_target {
@@ -40,21 +69,36 @@ namespace aurora::session_display {
       state.enabled = true;
     }
 
-    /** @brief Publish the initial target after a first frame and the matching input mapping are available. */
+    /** @brief Bind the first real converted source, and reject a later change before it can be encoded. */
+    bool observe_source(display_id id, bool ordinary) {
+      const std::lock_guard lock {mutex};
+      if (!state.enabled || state.source_lost) return false;
+      if (!id || (source && (source != id || ordinary_source != ordinary))) {
+        state.active = 0;
+        state.inventory_safe = false;
+        state.source_lost = true;
+        return false;
+      }
+      source = id;
+      ordinary_source = ordinary;
+      return true;
+    }
+
+    /** @brief Publish a host-sent real target that does not guarantee staged display exclusion. */
     bool report_initial(display_id id) {
       const std::lock_guard lock {mutex};
-      if (!id || !state.enabled || state.active) return false;
+      if (!id || !state.enabled || state.source_lost || source != id || state.active) return false;
       state.active = id;
       return true;
     }
 
     /**
-     * @brief Report the observed ordinary capture source after a real frame.
-     * @note Use only when normal capture and fallback exclude the session's staged leases.
+     * @brief Report the ordinary source after the host sends a packet with the verified ID.
      */
     bool report_inventory_ready(display_id id) {
       const std::lock_guard lock {mutex};
-      if (!id || !state.enabled || exclusive || state.pending) return false;
+      if (!id || !state.enabled || state.source_lost || source != id || !ordinary_source ||
+          exclusive || state.pending || state.inventory_safe) return false;
       state.active = id;
       state.inventory_safe = true;
       return true;
@@ -78,8 +122,9 @@ namespace aurora::session_display {
     /** @brief Confirm only after the exact new target has produced a frame, input is mapped and old capture is retired. */
     bool confirm(const switch_request &request) {
       const std::lock_guard lock {mutex};
-      if (!taken || state.pending != request || std::chrono::steady_clock::now() >= deadline) return false;
+      if (!taken || state.source_lost || state.pending != request || std::chrono::steady_clock::now() >= deadline) return false;
       state.active = request.id;
+      source = request.id;
       state.pending.reset();
       taken = false;
       return true;
@@ -130,12 +175,16 @@ namespace aurora::session_display {
     void close() {
       const std::lock_guard lock {mutex};
       state = {};
+      source = 0;
+      ordinary_source = false;
       taken = false;
     }
 
   private:
     mutable std::mutex mutex;
     capture_state state;
+    display_id source = 0;  ///< Exact source observed by the encoder before sender confirmation.
+    bool ordinary_source = false;  ///< Whether the source came from the ordinary, stage-excluding path.
     std::chrono::steady_clock::time_point deadline {};
     std::uint64_t generation = 0;
     bool taken = false;

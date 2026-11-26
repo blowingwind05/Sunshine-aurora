@@ -177,6 +177,9 @@ if (APPLE)
     list(APPEND TEST_SOURCES ${MACOS_TEST_SOURCES})
 endif ()
 
+# Standalone fixture programs in tests/scripts own their own entry points.
+list(FILTER TEST_SOURCES EXCLUDE REGEX "/tests/scripts/")
+
 set(SUNSHINE_SOURCES
         ${SUNSHINE_TARGET_FILES})
 

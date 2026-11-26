@@ -409,4 +409,9 @@ namespace display_device {
     }
     return outputs;
   }
+
+  bool aurora_virtual_monitor_t::owns_capture_id(std::uint32_t id) {
+    std::lock_guard lock {registry_mutex};
+    return registry.contains(id);
+  }
 }  // namespace display_device

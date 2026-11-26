@@ -68,6 +68,7 @@ namespace aurora::session_display {
               static_cast<unsigned>(owned->width), static_cast<unsigned>(owned->height), owned->refresh_rate});
             continue;
           }
+          if (native_monitor::owns_capture_id(id)) continue;
 
           const auto mode = CGDisplayCopyDisplayMode(id);
           const auto width = mode ? static_cast<unsigned>(CGDisplayModeGetPixelWidth(mode)) : 0;

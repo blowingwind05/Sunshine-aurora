@@ -13,6 +13,9 @@
 #include "platform/common.h"
 #include "thread_safe.h"
 #include "video_colorspace.h"
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  #include "aurora_session_display_capture.h"
+#endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -44,6 +47,9 @@ namespace video {
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
     bool aurora_client_cursor = false;  ///< Exclude the host cursor from captured video.
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    bool aurora_session_display_fixed = false;  ///< Keep the original capture target while serving display commands.
+#endif
   };
 
   namespace amf {
@@ -428,6 +434,9 @@ namespace video {
    */
   struct encode_session_t {
     virtual ~encode_session_t() = default;
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    aurora::session_display::encoded_display_source display_source;  ///< First real sample converted for this encoder.
+#endif
 
     /**
      * @brief Convert a captured frame into the encoder's required input representation.
@@ -534,6 +543,10 @@ namespace video {
 
     std::vector<replace_t> *replacements = nullptr;  ///< Optional encoded-byte substitutions applied before packetization.
     void *channel_data = nullptr;  ///< Platform or protocol state carried with this packet.
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    std::uint32_t source_display_id = 0;  ///< Exact Quartz ID on packets backed by a real capture sample.
+    bool ordinary_display_source = false;  ///< The capture path excludes staged Aurora monitors.
+#endif
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
   };

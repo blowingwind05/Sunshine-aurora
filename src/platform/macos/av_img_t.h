@@ -74,6 +74,10 @@ namespace platf {
    * @brief Captured macOS image backed by an AV sample buffer.
    */
   struct av_img_t: img_t {
+#ifdef AURORA_SUNSHINE_HOST
+    std::uint32_t source_display_id = 0;  ///< Quartz source ID on real samples only.
+    bool ordinary_display_source = false;  ///< This frame's capture path excludes staged Aurora monitors.
+#endif
     std::shared_ptr<av_sample_buf_t> sample_buffer;  ///< Retained AVFoundation sample buffer for the captured frame.
     std::shared_ptr<av_pixel_buf_t> pixel_buffer;  ///< Retained CoreVideo pixel buffer extracted from the sample.
   };

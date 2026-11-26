@@ -40,6 +40,10 @@ extern "C" {
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
   #include "aurora_video_bitrate.h"
 #endif
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  #include "platform/macos/av_img_t.h"
+  #include "stream.h"
+#endif
 
 #ifdef _WIN32
 extern "C" {
@@ -1523,8 +1527,10 @@ namespace video {
    * @param dev_type The encoder device type used for display lookup.
    * @param display_names The list of display names to repopulate.
    * @param current_display_index The current display index or -1 if not yet known.
+   * @param keep_current Require the previous output when reinitializing a managed capture.
+   * @return True when capture may continue with the selected output.
    */
-  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index) {
+  bool refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index, bool keep_current = false) {
     // It is possible that the output name may be empty even if it wasn't before (device disconnected) or vice-versa
     const auto output_name {display_device::map_output_name(config::video.output_name)};
     std::string current_display_name;
@@ -1539,10 +1545,13 @@ namespace video {
     display_names = platf::display_names(dev_type);
 
     // If we now have no displays, let's put the old display array back and fail
-    if (display_names.empty() && !old_display_names.empty()) {
+    if (display_names.empty() && keep_current && !current_display_name.empty()) {
+      BOOST_LOG(warning) << "Aurora could not re-enumerate the fixed capture display";
+      return false;
+    } else if (display_names.empty() && !old_display_names.empty()) {
       BOOST_LOG(error) << "No displays were found after reenumeration!"sv;
       display_names = std::move(old_display_names);
-      return;
+      return true;
     } else if (display_names.empty()) {
       display_names.emplace_back(output_name);
     }
@@ -1555,21 +1564,53 @@ namespace video {
       for (int x = 0; x < display_names.size(); ++x) {
         if (display_names[x] == current_display_name) {
           current_display_index = x;
-          return;
+          return true;
         }
       }
 
       // The old display was removed, so we'll start back at the first display again
       BOOST_LOG(warning) << "Previous active display ["sv << current_display_name << "] is no longer present"sv;
+      if (keep_current) {
+        return false;
+      }
     } else {
       for (int x = 0; x < display_names.size(); ++x) {
         if (display_names[x] == output_name) {
           current_display_index = x;
-          return;
+          return true;
         }
       }
     }
+    return true;
   }
+
+  /** @brief Whether an eligible managed Mac stream holds the initial capture selection. */
+  bool holds_capture_display([[maybe_unused]] const config_t &config) {
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+    return config.aurora_session_display_fixed;
+#else
+    return false;
+#endif
+  }
+
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+  /** @brief Bind a converted real Mac frame to the session and its current encoder. */
+  bool observe_capture_source(encode_session_t &encoder, const platf::img_t &img, std::int64_t pts, void *channel_data) {
+    if (!channel_data) {
+      return false;
+    }
+    const auto *frame = dynamic_cast<const platf::av_img_t *>(&img);
+    const auto id = frame ? frame->source_display_id : 0;
+    // Only the live stream worker enters this path. Encoder validation calls encode() separately.
+    auto &session = *static_cast<stream::session_t *>(channel_data);
+    const bool ordinary = frame && frame->ordinary_display_source;
+    if (!stream::session::aurora_display_capture(session).observe_source(id, ordinary)) {
+      return false;
+    }
+    encoder.display_source.observe(id, pts, ordinary);
+    return true;
+  }
+#endif
 
   /**
    * @brief Run the shared display capture thread for asynchronous encoding.
@@ -1747,8 +1788,11 @@ namespace video {
         }
 
         if (switch_display_event->peek()) {
-          artificial_reinit = true;
-          return false;
+          if (!std::ranges::any_of(capture_ctxs, [](const auto &ctx) { return holds_capture_display(ctx.config); })) {
+            artificial_reinit = true;
+            return false;
+          }
+          switch_display_event->pop(0ms);
         }
 
         return true;
@@ -1801,11 +1845,17 @@ namespace video {
               disp.reset();
 
               // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+              const bool fixed = std::ranges::any_of(capture_ctxs, [](const auto &ctx) { return holds_capture_display(ctx.config); });
+              if (!refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, fixed)) {
+                return;
+              }
 
               // Process any pending display switch with the new list of displays
               if (switch_display_event->peek()) {
-                display_p = std::clamp(*switch_display_event->pop(), 0, static_cast<int>(display_names.size()) - 1);
+                const auto requested = switch_display_event->pop(0ms);
+                if (!fixed && requested) {
+                  display_p = std::clamp(*requested, 0, static_cast<int>(display_names.size()) - 1);
+                }
               }
 
               // reset_display() will sleep between retries
@@ -1910,6 +1960,10 @@ namespace video {
       if (av_packet && av_packet->pts == frame_nr) {
         packet->frame_timestamp = frame_timestamp;
       }
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+      packet->source_display_id = session.display_source.for_packet(av_packet->pts);
+      packet->ordinary_display_source = session.display_source.allows_inventory();
+#endif
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
@@ -2522,6 +2576,12 @@ namespace video {
             BOOST_LOG(error) << "Could not convert image"sv;
             return;
           }
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+          if (config.aurora_session_display_fixed && !observe_capture_source(*session, *img, frame_nr, channel_data)) {
+            shutdown_event->raise(true);
+            return;
+          }
+#endif
         } else if (!images->running()) {
           break;
         }
@@ -2532,14 +2592,20 @@ namespace video {
       // b) Sunshine is quitting
       // c) The capture side is waiting to reinit and we've encoded at least one frame
       //
-      // If we have to reinit before we have received any captured frames, we will encode
-      // the blank dummy frame just to let Moonlight know that we're alive.
+      // Before the first captured frame, unmanaged streams may send a dummy frame on reinit.
+      // Managed display sessions release the old display without sending its placeholder.
       //
       // Ensure that this check occurs as close as possible to the encode call to prevent packets
       // in flight after encoder teardown.
-      if (shutdown_event->peek() || !images->running() || (reinit_event.peek() && frame_nr > 1)) {
+      if (shutdown_event->peek() || !images->running() ||
+          (reinit_event.peek() && (frame_nr > 1 || holds_capture_display(config)))) {
         break;
       }
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+      if (config.aurora_session_display_fixed && !session->display_source.for_packet(frame_nr)) {
+        continue;
+      }
+#endif
 
 #if defined(_WIN32) && defined(AURORA_SUNSHINE_HOST)
       if (live_encoder) {
@@ -2753,11 +2819,17 @@ namespace video {
 
     while (encode_session_ctx_queue.running()) {
       // Refresh display names since a display removal might have caused the reinitialization
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+      const bool fixed = std::ranges::any_of(synced_session_ctxs, [](const auto &ctx) { return holds_capture_display(ctx->config); });
+      if (!refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, fixed)) {
+        return encode_e::error;
+      }
 
       // Process any pending display switch with the new list of displays
       if (switch_display_event->peek()) {
-        display_p = std::clamp(*switch_display_event->pop(), 0, static_cast<int>(display_names.size()) - 1);
+        const auto requested = switch_display_event->pop(0ms);
+        if (!fixed && requested) {
+          display_p = std::clamp(*requested, 0, static_cast<int>(display_names.size()) - 1);
+        }
       }
 
       // reset_display() will sleep between retries
@@ -2835,6 +2907,18 @@ namespace video {
 
             continue;
           }
+#if defined(__APPLE__) && defined(AURORA_SUNSHINE_HOST)
+          if (ctx->config.aurora_session_display_fixed) {
+            if (frame_captured && !observe_capture_source(*pos->session, *img, ctx->frame_nr, ctx->channel_data)) {
+              ctx->shutdown_event->raise(true);
+              continue;
+            }
+            if (!pos->session->display_source.for_packet(ctx->frame_nr)) {
+              ++pos;
+              continue;
+            }
+          }
+#endif
 
           std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
           if (img) {
@@ -2854,8 +2938,11 @@ namespace video {
         })
 
         if (switch_display_event->peek()) {
-          ec = platf::capture_e::reinit;
-          return false;
+          if (!std::ranges::any_of(synced_session_ctxs, [](const auto &ctx) { return holds_capture_display(ctx->config); })) {
+            ec = platf::capture_e::reinit;
+            return false;
+          }
+          switch_display_event->pop(0ms);
         }
 
         return true;

@@ -82,9 +82,11 @@ int main() {
   require(!slots.published(*first), "pending output must not be enumerated");
   slots.publish(*second, 43);
   slots.retire(*first, 42);
+  require(slots.contains(42) && slots.contains(43) && !slots.contains(44), "ordinary capture excludes live and retiring owned IDs");
   slots.reap(after);
   require(!slots.reserve() && slots.published(*second) == 43 && !slots.published(*first), "failed owner still online holds only its slot");
   slots.reap(before);
+  require(!slots.contains(42) && slots.contains(43), "only the retired ID is reaped");
   require(slots.reserve() == first && slots.published(*second) == 43, "exact released ID can free capacity");
   slots.abandon(*first);
   require(slots.reserve() == first, "failure before native allocation frees its slot");

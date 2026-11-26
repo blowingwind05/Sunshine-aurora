@@ -235,6 +235,12 @@ namespace platf {
 
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
       auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
+#ifdef AURORA_SUNSHINE_HOST
+        if (!sampleBuffer || !CMSampleBufferIsValid(sampleBuffer) || !CMSampleBufferDataIsReady(sampleBuffer) ||
+            !CMSampleBufferGetImageBuffer(sampleBuffer)) {
+          return true;
+        }
+#endif
         auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
         auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
 
@@ -245,6 +251,10 @@ namespace platf {
           return false;
         }
         auto av_img = std::static_pointer_cast<av_img_t>(img_out);
+#ifdef AURORA_SUNSHINE_HOST
+        av_img->source_display_id = display_id;
+        av_img->ordinary_display_source = true;
+#endif
 
         auto old_data_retainer = std::make_shared<temp_retain_av_img_t>(
           av_img->sample_buffer,
@@ -272,6 +282,9 @@ namespace platf {
         return true;
       }];
 
+      if (!signal) {
+        return capture_e::error;
+      }
       // FIXME: We should time out if an image isn't returned for a while
       dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
 
@@ -325,10 +338,20 @@ namespace platf {
       }
 
       auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
+#ifdef AURORA_SUNSHINE_HOST
+        if (!sampleBuffer || !CMSampleBufferIsValid(sampleBuffer) || !CMSampleBufferDataIsReady(sampleBuffer) ||
+            !CMSampleBufferGetImageBuffer(sampleBuffer)) {
+          return true;
+        }
+#endif
         auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
         auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
 
         auto av_img = (av_img_t *) img;
+#ifdef AURORA_SUNSHINE_HOST
+        av_img->source_display_id = 0;
+        av_img->ordinary_display_source = false;
+#endif
 
         auto old_data_retainer = std::make_shared<temp_retain_av_img_t>(
           av_img->sample_buffer,
@@ -351,6 +374,9 @@ namespace platf {
         return false;
       }];
 
+      if (!signal) {
+        return -1;
+      }
       dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
 
       return 0;
@@ -519,6 +545,8 @@ namespace platf {
           return -1;
         }
         use_frame(first_frame, *image);
+        static_cast<av_img_t &>(*image).source_display_id = 0;
+        static_cast<av_img_t &>(*image).ordinary_display_source = false;
         return 0;
       }
 
@@ -562,6 +590,8 @@ namespace platf {
             return before_push;
           }
           use_frame(std::move(sample), *image);
+          static_cast<av_img_t &>(*image).source_display_id = display_id;
+          static_cast<av_img_t &>(*image).ordinary_display_source = false;
           deadline = std::chrono::steady_clock::now() + 5s;
           if (!push(std::move(image), true)) {
             // The existing switch mailbox may have asked for a rebuild of this revision.
@@ -753,6 +783,11 @@ namespace platf {
 
     BOOST_LOG(info) << "Configuring selected display ("sv << display->display_id << ") to stream"sv;
 
+#ifdef AURORA_SUNSHINE_HOST
+    if (display_device::aurora_virtual_monitor_t::owns_capture_id(display->display_id)) {
+      return nullptr;
+    }
+#endif
     display->av_capture = [[AVVideo alloc] initWithDisplay:display->display_id frameRate:config.framerate excludeCursor:config.aurora_client_cursor];
 
     if (!display->av_capture) {
@@ -793,6 +828,12 @@ namespace platf {
     display_names.reserve(devices.size());
     for (const auto &device : devices) {
       if (!device.m_display_name.empty()) {
+#ifdef AURORA_SUNSHINE_HOST
+        const auto id = parse_display_id(device.m_display_name);
+        if (id && display_device::aurora_virtual_monitor_t::owns_capture_id(*id)) {
+          continue;
+        }
+#endif
         display_names.emplace_back(device.m_display_name);
       }
     }

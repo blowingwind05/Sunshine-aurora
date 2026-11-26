@@ -68,6 +68,9 @@ namespace display_device {
     /** @brief Enumerate ready, live Aurora-owned targets, or report a failed snapshot. */
     [[nodiscard]] static std::optional<std::vector<aurora_virtual_target_t>> enumerate_owned();
 
+    /** @brief Whether ordinary capture must skip a known Aurora ID, including while it is retiring. */
+    [[nodiscard]] static bool owns_capture_id(std::uint32_t display_id);
+
     /**
      * @brief Release this lease after its capture stops. Safe to call again.
      * @return True when this lease is released and its owned ID is absent from an online snapshot.
